@@ -221,6 +221,255 @@ func (loop *ConversationLoop) runOneTurn(ctx context.Context) (string, error) {
 	return stopReason, nil
 }
 
+// SendMessageStreaming sends a user message and runs the full agentic loop, emitting
+// TurnEvents to the provided channel. The channel is NOT closed by this function;
+// callers should close it after this returns.
+func (loop *ConversationLoop) SendMessageStreaming(ctx context.Context, userText string, events chan<- TurnEvent) error {
+	loop.Session.Messages = append(loop.Session.Messages, api.Message{
+		Role: "user",
+		Content: []api.ContentBlock{
+			{Type: "text", Text: userText},
+		},
+	})
+
+	var totalInput, totalOutput int
+
+	for {
+		stopReason, inTok, outTok, err := loop.runOneTurnStreaming(ctx, events)
+		if err != nil {
+			events <- TurnEvent{Type: TurnEventError, Err: err}
+			return err
+		}
+		totalInput += inTok
+		totalOutput += outTok
+
+		if stopReason != "tool_use" {
+			break
+		}
+	}
+
+	events <- TurnEvent{
+		Type:         TurnEventUsage,
+		InputTokens:  totalInput,
+		OutputTokens: totalOutput,
+	}
+	events <- TurnEvent{Type: TurnEventDone}
+	return nil
+}
+
+// runOneTurnStreaming streams one API turn and sends TurnEvents.
+// Returns stop_reason, inputTokens, outputTokens, error.
+func (loop *ConversationLoop) runOneTurnStreaming(ctx context.Context, events chan<- TurnEvent) (string, int, int, error) {
+	req := api.CreateMessageRequest{
+		Model:     loop.Config.Model,
+		MaxTokens: loop.Config.MaxTokens,
+		System:    systemPrompt,
+		Messages:  loop.Session.Messages,
+		Tools:     loop.Tools,
+		Stream:    true,
+	}
+
+	ch, err := loop.Client.StreamResponse(ctx, req)
+	if err != nil {
+		return "", 0, 0, fmt.Errorf("stream response: %w", err)
+	}
+
+	type toolBlock struct {
+		id          string
+		name        string
+		inputBuffer string
+	}
+
+	var (
+		textBlocks   []api.ContentBlock
+		toolBlocks   []toolBlock
+		currentText  string
+		currentTool  *toolBlock
+		stopReason   string
+		blockTypeMap = make(map[int]string)
+		inputTokens  int
+		outputTokens int
+	)
+
+	for event := range ch {
+		switch event.Type {
+		case api.EventError:
+			return "", 0, 0, fmt.Errorf("stream error: %s", event.ErrorMessage)
+
+		case api.EventMessageStart:
+			inputTokens = event.InputTokens
+
+		case api.EventContentBlockStart:
+			blockTypeMap[event.Index] = event.ContentBlock.Type
+			if event.ContentBlock.Type == "tool_use" {
+				tb := toolBlock{
+					id:   event.ContentBlock.ID,
+					name: event.ContentBlock.Name,
+				}
+				toolBlocks = append(toolBlocks, tb)
+				currentTool = &toolBlocks[len(toolBlocks)-1]
+			}
+
+		case api.EventContentBlockDelta:
+			switch event.Delta.Type {
+			case "text_delta":
+				currentText += event.Delta.Text
+				select {
+				case events <- TurnEvent{Type: TurnEventTextDelta, Text: event.Delta.Text}:
+				case <-ctx.Done():
+					return "", 0, 0, ctx.Err()
+				}
+			case "input_json_delta":
+				if currentTool != nil {
+					currentTool.inputBuffer += event.Delta.PartialJSON
+				}
+			}
+
+		case api.EventContentBlockStop:
+			if bType, ok := blockTypeMap[event.Index]; ok && bType == "text" && currentText != "" {
+				textBlocks = append(textBlocks, api.ContentBlock{Type: "text", Text: currentText})
+				currentText = ""
+			}
+			currentTool = nil
+
+		case api.EventMessageDelta:
+			stopReason = event.StopReason
+			outputTokens = event.Usage.OutputTokens
+
+		case api.EventMessageStop:
+			// stream complete
+		}
+	}
+
+	// Build assistant message content
+	var assistantContent []api.ContentBlock
+	assistantContent = append(assistantContent, textBlocks...)
+
+	for _, tb := range toolBlocks {
+		var inputMap map[string]any
+		if tb.inputBuffer != "" {
+			if err := json.Unmarshal([]byte(tb.inputBuffer), &inputMap); err != nil {
+				inputMap = map[string]any{"raw": tb.inputBuffer}
+			}
+		} else {
+			inputMap = map[string]any{}
+		}
+		assistantContent = append(assistantContent, api.ContentBlock{
+			Type:  "tool_use",
+			ID:    tb.id,
+			Name:  tb.name,
+			Input: inputMap,
+		})
+	}
+
+	if len(assistantContent) > 0 {
+		loop.Session.Messages = append(loop.Session.Messages, api.Message{
+			Role:    "assistant",
+			Content: assistantContent,
+		})
+	}
+
+	// Execute tools if needed
+	if stopReason == "tool_use" {
+		var toolResults []api.ContentBlock
+
+		for _, tb := range toolBlocks {
+			var inputMap map[string]any
+			for _, cb := range assistantContent {
+				if cb.Type == "tool_use" && cb.ID == tb.id {
+					inputMap = cb.Input
+					break
+				}
+			}
+			if inputMap == nil {
+				inputMap = map[string]any{}
+			}
+
+			summary := summarizeToolInput(inputMap)
+			select {
+			case events <- TurnEvent{Type: TurnEventToolStart, ToolName: tb.name, ToolInput: summary}:
+			case <-ctx.Done():
+				return "", 0, 0, ctx.Err()
+			}
+
+			result := loop.ExecuteToolQuiet(tb.name, inputMap)
+			result.ToolUseID = tb.id
+			toolResults = append(toolResults, result)
+
+			resultText := ""
+			if len(result.Content) > 0 {
+				resultText = result.Content[0].Text
+			}
+			select {
+			case events <- TurnEvent{Type: TurnEventToolDone, ToolName: tb.name, ToolResult: resultText}:
+			case <-ctx.Done():
+				return "", 0, 0, ctx.Err()
+			}
+		}
+
+		loop.Session.Messages = append(loop.Session.Messages, api.Message{
+			Role:    "user",
+			Content: toolResults,
+		})
+	}
+
+	return stopReason, inputTokens, outputTokens, nil
+}
+
+// ExecuteToolQuiet dispatches to the appropriate tool without printing to stdout/stderr.
+func (loop *ConversationLoop) ExecuteToolQuiet(name string, input map[string]any) api.ContentBlock {
+	if !CheckPermission(loop.Permissions, name) {
+		return api.ContentBlock{
+			Type:    "tool_result",
+			Content: []api.ContentBlock{{Type: "text", Text: fmt.Sprintf("Permission denied for tool: %s", name)}},
+			IsError: true,
+		}
+	}
+
+	var result string
+	var err error
+
+	switch name {
+	case "bash":
+		result, err = tools.ExecuteBash(input)
+	case "read_file":
+		result, err = tools.ExecuteReadFile(input)
+	case "write_file":
+		result, err = tools.ExecuteWriteFile(input)
+	case "glob":
+		result, err = tools.ExecuteGlob(input)
+	case "grep":
+		result, err = tools.ExecuteGrep(input)
+	default:
+		err = fmt.Errorf("unknown tool: %s", name)
+	}
+
+	isError := err != nil
+	text := result
+	if err != nil {
+		text = fmt.Sprintf("Error: %v", err)
+	}
+
+	return api.ContentBlock{
+		Type:    "tool_result",
+		Content: []api.ContentBlock{{Type: "text", Text: text}},
+		IsError: isError,
+	}
+}
+
+// summarizeToolInput returns a short human-readable summary of tool inputs.
+func summarizeToolInput(input map[string]any) string {
+	for _, key := range []string{"command", "path", "file_path", "pattern"} {
+		if v, ok := input[key].(string); ok {
+			if len(v) > 60 {
+				return v[:60] + "..."
+			}
+			return v
+		}
+	}
+	return ""
+}
+
 // ClearSession resets the conversation history in the current session.
 func (loop *ConversationLoop) ClearSession() {
 	loop.Session.Messages = []api.Message{}

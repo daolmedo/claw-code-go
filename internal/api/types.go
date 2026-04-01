@@ -135,6 +135,9 @@ type StreamEvent struct {
 	// message_delta stop reason (parsed from "delta" field in message_delta events)
 	StopReason string `json:"-"`
 
+	// message_start input token count (parsed from "message.usage.input_tokens")
+	InputTokens int `json:"-"`
+
 	// Error
 	ErrorMessage string `json:"-"`
 }

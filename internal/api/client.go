@@ -194,6 +194,21 @@ func parseSSEData(data string) (StreamEvent, error) {
 		json.Unmarshal(usageRaw, &event.Usage) //nolint:errcheck
 	}
 
+	// Parse "message.usage.input_tokens" for message_start events
+	if messageRaw, ok := raw["message"]; ok {
+		var msgMap map[string]json.RawMessage
+		if err := json.Unmarshal(messageRaw, &msgMap); err == nil {
+			if usageRaw, ok := msgMap["usage"]; ok {
+				var usage struct {
+					InputTokens int `json:"input_tokens"`
+				}
+				if err := json.Unmarshal(usageRaw, &usage); err == nil {
+					event.InputTokens = usage.InputTokens
+				}
+			}
+		}
+	}
+
 	// Parse error details
 	if event.Type == EventError {
 		if errRaw, ok := raw["error"]; ok {
