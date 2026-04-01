@@ -30,10 +30,11 @@ var knownModels = []struct {
 type appState int
 
 const (
-	stateInput    appState = iota // waiting for user input
-	stateBusy                     // streaming response from API
-	statePicker                   // model selection overlay
-	stateHelp                     // help panel overlay
+	stateInput      appState = iota // waiting for user input
+	stateBusy                       // streaming response from API
+	statePicker                     // model selection overlay
+	stateHelp                       // help panel overlay
+	statePermission                 // waiting for permission decision
 )
 
 // Bubble Tea messages for async streaming events.
@@ -44,6 +45,10 @@ type (
 	streamUsageMsg    struct{ inputTokens, outputTokens int }
 	streamDoneMsg     struct{}
 	streamErrMsg      struct{ err error }
+	streamPermAskMsg  struct {
+		name, input string
+		reply       chan runtime.PermDecision
+	}
 )
 
 // Model is the Bubble Tea application model.
@@ -73,6 +78,11 @@ type Model struct {
 
 	// channel from active streaming goroutine
 	streamChan chan runtime.TurnEvent
+
+	// permission ask state
+	permToolName  string
+	permToolInput string
+	permReplyCh   chan runtime.PermDecision
 
 	// app deps
 	loop *runtime.ConversationLoop
@@ -168,6 +178,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.viewport.GotoBottom()
 		return m, nil
 
+	case streamPermAskMsg:
+		m.state = statePermission
+		m.permToolName = msg.name
+		m.permToolInput = msg.input
+		m.permReplyCh = msg.reply
+		m = m.refreshViewport()
+		return m, nil
+
 	case streamErrMsg:
 		m.viewBuf += errorStyle.Render(fmt.Sprintf("Error: %v\n\n", msg.err))
 		m.streamBuf = ""
@@ -195,6 +213,8 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.handlePickerKey(msg)
 	case stateHelp:
 		return m.handleHelpKey(msg)
+	case statePermission:
+		return m.handlePermissionKey(msg)
 	case stateBusy:
 		// Only allow quit during streaming
 		if msg.Type == tea.KeyCtrlC {
@@ -402,6 +422,45 @@ func (m Model) handleHelpKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// handlePermissionKey handles keys when a permission decision is pending.
+func (m Model) handlePermissionKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	var decision runtime.PermDecision
+	handled := true
+
+	switch msg.String() {
+	case "y", "Y":
+		decision = runtime.PermDecisionAllowOnce
+	case "a", "A":
+		decision = runtime.PermDecisionAllowAlways
+	case "n", "N":
+		decision = runtime.PermDecisionDeny
+	default:
+		if msg.Type == tea.KeyCtrlC {
+			return m, tea.Quit
+		}
+		handled = false
+	}
+
+	if !handled {
+		return m, nil
+	}
+
+	ch := m.permReplyCh
+	m.permReplyCh = nil
+	m.permToolName = ""
+	m.permToolInput = ""
+	m.state = stateBusy
+	m = m.refreshViewport()
+
+	return m, tea.Batch(
+		func() tea.Msg {
+			ch <- decision
+			return nil
+		},
+		waitForStream(m.streamChan),
+	)
+}
+
 // --- View -------------------------------------------------------------------
 
 // View is the Bubble Tea View function.
@@ -415,6 +474,8 @@ func (m Model) View() string {
 		return m.viewPicker()
 	case stateHelp:
 		return m.viewHelp()
+	case statePermission:
+		return m.viewPermission()
 	}
 
 	header := m.renderHeader()
@@ -486,6 +547,25 @@ func (m Model) viewHelp() string {
 	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, box)
 }
 
+func (m Model) viewPermission() string {
+	tool := userLabelStyle.Render(m.permToolName)
+	inp := m.permToolInput
+	if len(inp) > 60 {
+		inp = inp[:60] + "..."
+	}
+	prompt := fmt.Sprintf("Allow %s: %s?", tool, inp)
+	hint := statusStyle.Render("[y]es-once  [a]lways  [n]o")
+	content := lipgloss.JoinVertical(lipgloss.Left,
+		headerStyle.Render("Permission Required"),
+		"",
+		"  "+prompt,
+		"",
+		"  "+hint,
+	)
+	box := helpBoxStyle.Width(min(72, m.width-4)).Render(content)
+	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, box)
+}
+
 // --- Helpers ----------------------------------------------------------------
 
 // waitForStream returns a tea.Cmd that reads the next event from the stream channel.
@@ -509,6 +589,8 @@ func waitForStream(ch <-chan runtime.TurnEvent) tea.Cmd {
 				return streamDoneMsg{}
 			case runtime.TurnEventError:
 				return streamErrMsg{err: ev.Err}
+			case runtime.TurnEventPermissionAsk:
+				return streamPermAskMsg{name: ev.ToolName, input: ev.ToolInput, reply: ev.PermReply}
 			}
 		}
 	}

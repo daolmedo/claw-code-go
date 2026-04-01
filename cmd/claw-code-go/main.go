@@ -3,6 +3,7 @@ package main
 import (
 	"claw-code-go/internal/auth"
 	"claw-code-go/internal/commands"
+	"claw-code-go/internal/permissions"
 	"claw-code-go/internal/runtime"
 	"claw-code-go/internal/tui"
 	"context"
@@ -21,6 +22,7 @@ func main() {
 	replFlag := flag.Bool("repl", false, "Run in interactive REPL mode (default when no --prompt)")
 	sessionFlag := flag.String("session", "", "Session ID to load")
 	sessionDirFlag := flag.String("session-dir", "", "Directory to store sessions")
+	permModeFlag := flag.String("permission-mode", "default", "Permission mode: default, accept-edits, bypass, plan")
 	_ = replFlag
 
 	flag.Usage = func() {
@@ -70,6 +72,19 @@ func main() {
 	}
 
 	loop := runtime.NewConversationLoop(cfg, client)
+
+	// Wire up the Phase 5 permission manager.
+	permMode, err := permissions.ParsePermissionMode(*permModeFlag)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: %v; using default mode\n", err)
+		permMode = permissions.ModeDefault
+	}
+	ruleset, rErr := permissions.LoadRuleset(".claude/settings.json")
+	if rErr != nil {
+		fmt.Fprintf(os.Stderr, "Warning: could not load .claude/settings.json: %v\n", rErr)
+		ruleset = &permissions.Ruleset{}
+	}
+	loop.PermManager = permissions.NewManager(permMode, ruleset)
 
 	// Connect to MCP servers defined in config (non-fatal errors are printed).
 	loop.InitMCPFromConfig(context.Background())

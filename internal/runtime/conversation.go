@@ -3,6 +3,7 @@ package runtime
 import (
 	"claw-code-go/internal/api"
 	"claw-code-go/internal/mcp"
+	"claw-code-go/internal/permissions"
 	"claw-code-go/internal/tools"
 	"context"
 	"encoding/json"
@@ -19,6 +20,7 @@ type ConversationLoop struct {
 	Session     *Session
 	Tools       []api.Tool
 	Permissions *Permissions
+	PermManager *permissions.Manager // Phase 5 permission manager (may be nil)
 	Config      *Config
 	MCPRegistry *mcp.Registry // MCP server registry (may be nil)
 }
@@ -416,6 +418,71 @@ func (loop *ConversationLoop) runOneTurnStreaming(ctx context.Context, events ch
 			}
 
 			summary := summarizeToolInput(inputMap)
+
+			// --- Permission check (Phase 5) ---
+			if loop.PermManager != nil {
+				decision := loop.PermManager.Check(tb.name, summary)
+
+				// Plan mode: describe without executing.
+				if loop.PermManager.Mode == permissions.ModePlan {
+					planResult := api.ContentBlock{
+						Type:    "tool_result",
+						ToolUseID: tb.id,
+						Content: []api.ContentBlock{{Type: "text", Text: fmt.Sprintf("[Plan: %s %s]", tb.name, summary)}},
+					}
+					toolResults = append(toolResults, planResult)
+					continue
+				}
+
+				switch decision {
+				case permissions.DecisionDeny:
+					denied := api.ContentBlock{
+						Type:    "tool_result",
+						ToolUseID: tb.id,
+						Content: []api.ContentBlock{{Type: "text", Text: fmt.Sprintf("Permission denied for tool: %s", tb.name)}},
+						IsError: true,
+					}
+					toolResults = append(toolResults, denied)
+					continue
+
+				case permissions.DecisionAsk:
+					replyCh := make(chan PermDecision, 1)
+					select {
+					case events <- TurnEvent{
+						Type:      TurnEventPermissionAsk,
+						ToolName:  tb.name,
+						ToolInput: summary,
+						PermReply: replyCh,
+					}:
+					case <-ctx.Done():
+						return "", 0, 0, ctx.Err()
+					}
+
+					var userDecision PermDecision
+					select {
+					case userDecision = <-replyCh:
+					case <-ctx.Done():
+						return "", 0, 0, ctx.Err()
+					}
+
+					switch userDecision {
+					case PermDecisionDeny:
+						denied := api.ContentBlock{
+							Type:    "tool_result",
+							ToolUseID: tb.id,
+							Content: []api.ContentBlock{{Type: "text", Text: fmt.Sprintf("Permission denied for tool: %s", tb.name)}},
+							IsError: true,
+						}
+						toolResults = append(toolResults, denied)
+						continue
+					case PermDecisionAllowAlways:
+						loop.PermManager.Remember(tb.name, summary, permissions.DecisionAllow, permissions.ScopeAlways)
+					}
+					// PermDecisionAllowOnce falls through to execution
+				}
+				// DecisionAllow falls through to execution
+			}
+
 			select {
 			case events <- TurnEvent{Type: TurnEventToolStart, ToolName: tb.name, ToolInput: summary}:
 			case <-ctx.Done():
