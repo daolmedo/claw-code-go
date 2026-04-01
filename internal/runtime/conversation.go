@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"claw-code-go/internal/api"
+	clawctx "claw-code-go/internal/context"
 	"claw-code-go/internal/mcp"
 	"claw-code-go/internal/permissions"
 	"claw-code-go/internal/tools"
@@ -16,19 +17,21 @@ const systemPromptBase = `You are Claude Code, an AI assistant for software engi
 
 // ConversationLoop manages the agentic conversation loop with tool use.
 type ConversationLoop struct {
-	Client      api.APIClient // provider-agnostic client interface
-	Session     *Session
-	Tools       []api.Tool
-	Permissions *Permissions
-	PermManager *permissions.Manager // Phase 5 permission manager (may be nil)
-	Config      *Config
-	MCPRegistry *mcp.Registry // MCP server registry (may be nil)
-	Compaction  CompactionState // Phase 6 token tracking and compaction state
+	Client          api.APIClient // provider-agnostic client interface
+	Session         *Session
+	Tools           []api.Tool
+	Permissions     *Permissions
+	PermManager     *permissions.Manager  // Phase 5 permission manager (may be nil)
+	Config          *Config
+	MCPRegistry     *mcp.Registry         // MCP server registry (may be nil)
+	Compaction      CompactionState        // Phase 6 token tracking and compaction state
+	CtxAssembler    *clawctx.Assembler    // Phase 12 context assembler (may be nil)
 }
 
 // NewConversationLoop creates a new conversation loop with the given client.
 // Use NewProviderClient to create an appropriate client for the configured provider.
 func NewConversationLoop(cfg *Config, client api.APIClient) *ConversationLoop {
+	workDir, _ := os.Getwd()
 	return &ConversationLoop{
 		Client:  client,
 		Session: NewSession(),
@@ -44,8 +47,9 @@ func NewConversationLoop(cfg *Config, client api.APIClient) *ConversationLoop {
 			tools.AskUserQuestionTool(),
 			tools.TodoWriteTool(),
 		},
-		Permissions: DefaultPermissions(),
-		Config:      cfg,
+		Permissions:  DefaultPermissions(),
+		Config:       cfg,
+		CtxAssembler: clawctx.NewAssembler(workDir),
 	}
 }
 
@@ -54,11 +58,18 @@ func (loop *ConversationLoop) SystemPrompt() string {
 	return loop.systemPrompt()
 }
 
-// systemPrompt returns the system prompt, optionally injecting a compaction
-// summary and MCP tool context.
+// systemPrompt returns the system prompt, optionally injecting project context,
+// compaction summary, and MCP tool context.
 func (loop *ConversationLoop) systemPrompt() string {
 	var parts []string
 	parts = append(parts, systemPromptBase)
+
+	// Inject project context (Phase 12): environment, git status, CLAUDE.md.
+	if loop.CtxAssembler != nil {
+		if ctx := loop.CtxAssembler.Assemble(); ctx != "" {
+			parts = append(parts, ctx)
+		}
+	}
 
 	// Inject compaction summary when the session has one (Phase 6).
 	if loop.Session != nil && loop.Session.CompactionSummary != "" {
