@@ -71,6 +71,9 @@ func main() {
 
 	loop := runtime.NewConversationLoop(cfg, client)
 
+	// Connect to MCP servers defined in config (non-fatal errors are printed).
+	loop.InitMCPFromConfig(context.Background())
+
 	if *sessionFlag != "" {
 		sess, err := runtime.LoadSession(cfg.SessionDir, *sessionFlag)
 		if err != nil {
@@ -110,6 +113,7 @@ func runTUI(cfg *runtime.Config, loop *runtime.ConversationLoop) {
 	// Register slash commands (available for future non-TUI REPL mode).
 	registry := commands.NewRegistry()
 	commands.RegisterAuthCommands(registry)
+	commands.RegisterMCPCommand(registry)
 	_ = registry
 
 	// Save session on SIGTERM (Ctrl+C is handled by Bubble Tea itself).

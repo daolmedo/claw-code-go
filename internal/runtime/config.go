@@ -1,6 +1,7 @@
 package runtime
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 )
@@ -9,6 +10,16 @@ const (
 	DefaultModel     = "claude-sonnet-4-20250514"
 	DefaultMaxTokens = 8096
 )
+
+// MCPServerConfig describes a single MCP server connection.
+type MCPServerConfig struct {
+	Name      string            `json:"name"`
+	Transport string            `json:"transport"` // "stdio" or "sse"
+	Command   string            `json:"command,omitempty"`
+	Args      []string          `json:"args,omitempty"`
+	URL       string            `json:"url,omitempty"`
+	Env       map[string]string `json:"env,omitempty"`
+}
 
 // Config holds runtime configuration for the CLI.
 type Config struct {
@@ -26,6 +37,9 @@ type Config struct {
 	AuthMethod string
 	// OAuthToken is the resolved OAuth access token (set at startup when using OAuth).
 	OAuthToken string
+
+	// MCPServers lists MCP server connections (Phase 4).
+	MCPServers []MCPServerConfig
 }
 
 // LoadConfig reads configuration from environment variables and applies defaults.
@@ -58,7 +72,41 @@ func LoadConfig() *Config {
 	// Detect the active provider from environment variables.
 	cfg.ProviderName = detectProvider()
 
+	// Load MCP server configs.
+	cfg.MCPServers = loadMCPServers(homeDir)
+
 	return cfg
+}
+
+// loadMCPServers reads MCP server configurations from the settings file and
+// the CLAUDE_MCP_SERVERS environment variable (JSON override, takes precedence).
+func loadMCPServers(homeDir string) []MCPServerConfig {
+	// Try env var override first.
+	if raw := os.Getenv("CLAUDE_MCP_SERVERS"); raw != "" {
+		var servers []MCPServerConfig
+		if err := json.Unmarshal([]byte(raw), &servers); err == nil {
+			return servers
+		}
+	}
+
+	// Otherwise read from ~/.claude/settings.json.
+	if homeDir == "" {
+		return nil
+	}
+	settingsPath := filepath.Join(homeDir, ".claude", "settings.json")
+	data, err := os.ReadFile(settingsPath)
+	if err != nil {
+		return nil
+	}
+
+	var settings struct {
+		MCPServers []MCPServerConfig `json:"mcpServers"`
+	}
+	if err := json.Unmarshal(data, &settings); err != nil {
+		return nil
+	}
+
+	return settings.MCPServers
 }
 
 // detectProvider reads env vars to determine which provider to use.

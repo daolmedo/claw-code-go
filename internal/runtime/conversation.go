@@ -2,14 +2,16 @@ package runtime
 
 import (
 	"claw-code-go/internal/api"
+	"claw-code-go/internal/mcp"
 	"claw-code-go/internal/tools"
 	"context"
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 )
 
-const systemPrompt = `You are Claude Code, an AI assistant for software engineering tasks. You have access to tools for running bash commands, reading and writing files, searching with glob patterns, and grepping for patterns in code. Use these tools to help users with coding tasks.`
+const systemPromptBase = `You are Claude Code, an AI assistant for software engineering tasks. You have access to tools for running bash commands, reading and writing files, searching with glob patterns, and grepping for patterns in code. Use these tools to help users with coding tasks.`
 
 // ConversationLoop manages the agentic conversation loop with tool use.
 type ConversationLoop struct {
@@ -18,6 +20,7 @@ type ConversationLoop struct {
 	Tools       []api.Tool
 	Permissions *Permissions
 	Config      *Config
+	MCPRegistry *mcp.Registry // MCP server registry (may be nil)
 }
 
 // NewConversationLoop creates a new conversation loop with the given client.
@@ -36,6 +39,37 @@ func NewConversationLoop(cfg *Config, client api.APIClient) *ConversationLoop {
 		Permissions: DefaultPermissions(),
 		Config:      cfg,
 	}
+}
+
+// systemPrompt returns the system prompt, optionally appending MCP tool context.
+func (loop *ConversationLoop) systemPrompt() string {
+	if loop.MCPRegistry == nil {
+		return systemPromptBase
+	}
+	mcpTools := loop.MCPRegistry.AllTools()
+	if len(mcpTools) == 0 {
+		return systemPromptBase
+	}
+	names := make([]string, len(mcpTools))
+	for i, t := range mcpTools {
+		names[i] = t.Name
+	}
+	return systemPromptBase + "\n\nAdditional tools available via MCP: " + strings.Join(names, ", ") + "."
+}
+
+// allTools returns built-in tools merged with any MCP tools.
+func (loop *ConversationLoop) allTools() []api.Tool {
+	if loop.MCPRegistry == nil {
+		return loop.Tools
+	}
+	mcpAPITools := loop.MCPRegistry.AllAPITools()
+	if len(mcpAPITools) == 0 {
+		return loop.Tools
+	}
+	combined := make([]api.Tool, 0, len(loop.Tools)+len(mcpAPITools))
+	combined = append(combined, loop.Tools...)
+	combined = append(combined, mcpAPITools...)
+	return combined
 }
 
 // SendMessage sends a user message and runs the full agentic loop.
@@ -69,9 +103,9 @@ func (loop *ConversationLoop) runOneTurn(ctx context.Context) (string, error) {
 	req := api.CreateMessageRequest{
 		Model:     loop.Config.Model,
 		MaxTokens: loop.Config.MaxTokens,
-		System:    systemPrompt,
+		System:    loop.systemPrompt(),
 		Messages:  loop.Session.Messages,
-		Tools:     loop.Tools,
+		Tools:     loop.allTools(),
 		Stream:    true,
 	}
 
@@ -259,9 +293,9 @@ func (loop *ConversationLoop) runOneTurnStreaming(ctx context.Context, events ch
 	req := api.CreateMessageRequest{
 		Model:     loop.Config.Model,
 		MaxTokens: loop.Config.MaxTokens,
-		System:    systemPrompt,
+		System:    loop.systemPrompt(),
 		Messages:  loop.Session.Messages,
-		Tools:     loop.Tools,
+		Tools:     loop.allTools(),
 		Stream:    true,
 	}
 
@@ -437,6 +471,25 @@ func (loop *ConversationLoop) ExecuteToolQuiet(name string, input map[string]any
 	case "grep":
 		result, err = tools.ExecuteGrep(input)
 	default:
+		// Fall back to MCP registry.
+		if loop.MCPRegistry != nil {
+			if client, _, ok := loop.MCPRegistry.FindTool(name); ok {
+				mcpResult, mcpErr := client.CallTool(context.Background(), name, input)
+				if mcpErr != nil {
+					return api.ContentBlock{
+						Type:    "tool_result",
+						Content: []api.ContentBlock{{Type: "text", Text: fmt.Sprintf("Error: %v", mcpErr)}},
+						IsError: true,
+					}
+				}
+				text := mcpResultText(mcpResult)
+				return api.ContentBlock{
+					Type:    "tool_result",
+					Content: []api.ContentBlock{{Type: "text", Text: text}},
+					IsError: mcpResult.IsError,
+				}
+			}
+		}
 		err = fmt.Errorf("unknown tool: %s", name)
 	}
 
@@ -501,6 +554,27 @@ func (loop *ConversationLoop) ExecuteTool(name string, input map[string]any) api
 	case "grep":
 		result, err = tools.ExecuteGrep(input)
 	default:
+		// Fall back to MCP registry.
+		if loop.MCPRegistry != nil {
+			if client, _, ok := loop.MCPRegistry.FindTool(name); ok {
+				mcpResult, mcpErr := client.CallTool(context.Background(), name, input)
+				if mcpErr != nil {
+					fmt.Fprintf(os.Stderr, "[MCP tool %s error]: %v\n", name, mcpErr)
+					return api.ContentBlock{
+						Type:    "tool_result",
+						Content: []api.ContentBlock{{Type: "text", Text: fmt.Sprintf("Error: %v", mcpErr)}},
+						IsError: true,
+					}
+				}
+				text := mcpResultText(mcpResult)
+				fmt.Fprintf(os.Stdout, "%s\n", text)
+				return api.ContentBlock{
+					Type:    "tool_result",
+					Content: []api.ContentBlock{{Type: "text", Text: text}},
+					IsError: mcpResult.IsError,
+				}
+			}
+		}
 		err = fmt.Errorf("unknown tool: %s", name)
 	}
 
@@ -520,4 +594,126 @@ func (loop *ConversationLoop) ExecuteTool(name string, input map[string]any) api
 		},
 		IsError: isError,
 	}
+}
+
+// mcpResultText extracts the concatenated text from an MCP tool result.
+func mcpResultText(r mcp.MCPToolResult) string {
+	var parts []string
+	for _, c := range r.Content {
+		if c.Text != "" {
+			parts = append(parts, c.Text)
+		}
+	}
+	return strings.Join(parts, "\n")
+}
+
+// InitMCPFromConfig connects to all MCP servers defined in the config.
+// Errors are printed but do not abort startup.
+func (loop *ConversationLoop) InitMCPFromConfig(ctx context.Context) {
+	if len(loop.Config.MCPServers) == 0 {
+		return
+	}
+	if loop.MCPRegistry == nil {
+		loop.MCPRegistry = mcp.NewRegistry()
+	}
+	for _, srv := range loop.Config.MCPServers {
+		var transport mcp.Transport
+		var err error
+
+		switch strings.ToLower(srv.Transport) {
+		case "stdio":
+			var envPairs []string
+			for k, v := range srv.Env {
+				envPairs = append(envPairs, k+"="+v)
+			}
+			transport, err = mcp.NewStdioTransport(srv.Command, srv.Args, envPairs)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "[MCP] failed to start stdio server %q: %v\n", srv.Name, err)
+				continue
+			}
+		case "sse", "http":
+			auth := ""
+			if tok, ok := srv.Env["AUTHORIZATION"]; ok {
+				auth = tok
+			}
+			transport = mcp.NewSSETransport(srv.URL, auth)
+		default:
+			fmt.Fprintf(os.Stderr, "[MCP] unknown transport %q for server %q\n", srv.Transport, srv.Name)
+			continue
+		}
+
+		if err := loop.MCPRegistry.AddServer(ctx, srv.Name, transport); err != nil {
+			fmt.Fprintf(os.Stderr, "[MCP] failed to connect to server %q: %v\n", srv.Name, err)
+		} else {
+			toolCount := len(loop.MCPRegistry.ServerTools(srv.Name))
+			fmt.Fprintf(os.Stdout, "[MCP] connected to %q (%d tools)\n", srv.Name, toolCount)
+		}
+	}
+}
+
+// MCPConnect connects to a named MCP server defined in config.
+func (loop *ConversationLoop) MCPConnect(ctx context.Context, name string) error {
+	if loop.MCPRegistry == nil {
+		loop.MCPRegistry = mcp.NewRegistry()
+	}
+	for _, srv := range loop.Config.MCPServers {
+		if srv.Name != name {
+			continue
+		}
+		var transport mcp.Transport
+		var err error
+		switch strings.ToLower(srv.Transport) {
+		case "stdio":
+			var envPairs []string
+			for k, v := range srv.Env {
+				envPairs = append(envPairs, k+"="+v)
+			}
+			transport, err = mcp.NewStdioTransport(srv.Command, srv.Args, envPairs)
+			if err != nil {
+				return err
+			}
+		case "sse", "http":
+			auth := ""
+			if tok, ok := srv.Env["AUTHORIZATION"]; ok {
+				auth = tok
+			}
+			transport = mcp.NewSSETransport(srv.URL, auth)
+		default:
+			return fmt.Errorf("unknown transport %q", srv.Transport)
+		}
+		return loop.MCPRegistry.AddServer(ctx, name, transport)
+	}
+	return fmt.Errorf("MCP server %q not found in config", name)
+}
+
+// MCPDisconnect disconnects from a named MCP server.
+func (loop *ConversationLoop) MCPDisconnect(name string) error {
+	if loop.MCPRegistry == nil {
+		return fmt.Errorf("no MCP servers connected")
+	}
+	return loop.MCPRegistry.Disconnect(name)
+}
+
+// MCPList returns a human-readable summary of connected MCP servers and their tools.
+func (loop *ConversationLoop) MCPList() string {
+	if loop.MCPRegistry == nil {
+		return "No MCP servers connected.\n"
+	}
+	names := loop.MCPRegistry.ServerNames()
+	if len(names) == 0 {
+		return "No MCP servers connected.\n"
+	}
+	var sb strings.Builder
+	for _, name := range names {
+		tools := loop.MCPRegistry.ServerTools(name)
+		fmt.Fprintf(&sb, "Server: %s (%d tools)\n", name, len(tools))
+		for _, t := range tools {
+			desc := t.Description
+			if len(desc) > 60 {
+				desc = desc[:60] + "..."
+			}
+			fmt.Fprintf(&sb, "  - %s: %s\n", t.Name, desc)
+		}
+	}
+	return sb.String()
 }
