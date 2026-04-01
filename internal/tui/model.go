@@ -75,6 +75,7 @@ const (
 	stateLoginMethod                    // /login: auth-method picker (Anthropic)
 	stateLoginAPIKey                    // /login: API key text input
 	stateLoginOAuth                     // /login: waiting for OAuth browser flow
+	stateAskUser                        // agent has asked the user a question
 )
 
 // Bubble Tea messages for async streaming events.
@@ -89,6 +90,10 @@ type (
 	streamPermAskMsg  struct {
 		name, input string
 		reply       chan runtime.PermDecision
+	}
+	streamAskUserMsg struct {
+		question string
+		reply    chan string
 	}
 )
 
@@ -135,6 +140,11 @@ type Model struct {
 	permToolName  string
 	permToolInput string
 	permReplyCh   chan runtime.PermDecision
+
+	// ask_user state
+	askUserQuestion string
+	askUserReplyCh  chan string
+	askUserInput    textinput.Model
 
 	// /login flow state
 	loginCursor   int             // cursor for provider / method pickers
@@ -258,6 +268,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m = m.refreshViewport()
 		return m, nil
 
+	case streamAskUserMsg:
+		ti := textinput.New()
+		ti.Placeholder = "Type your answer and press Enter..."
+		ti.CharLimit = 2048
+		ti.Focus()
+		m.askUserInput = ti
+		m.askUserQuestion = msg.question
+		m.askUserReplyCh = msg.reply
+		m.state = stateAskUser
+		m = m.refreshViewport()
+		return m, nil
+
 	case streamErrMsg:
 		m.viewBuf += errorStyle.Render(fmt.Sprintf("Error: %v\n\n", msg.err))
 		m.streamBuf = ""
@@ -290,6 +312,8 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.handleHelpKey(msg)
 	case statePermission:
 		return m.handlePermissionKey(msg)
+	case stateAskUser:
+		return m.handleAskUserKey(msg)
 	case stateLoginProvider:
 		return m.handleLoginProviderKey(msg)
 	case stateLoginMethod:
@@ -704,6 +728,58 @@ func (m Model) handleLoginComplete(result loginCompleteMsg) (tea.Model, tea.Cmd)
 	return m, nil
 }
 
+// handleAskUserKey handles key input when the agent is waiting for a user answer.
+func (m Model) handleAskUserKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.Type {
+	case tea.KeyCtrlC:
+		return m, tea.Quit
+	case tea.KeyEsc:
+		// Cancel — send empty string so the agent loop can proceed.
+		ch := m.askUserReplyCh
+		m.askUserReplyCh = nil
+		m.askUserQuestion = ""
+		m.state = stateBusy
+		m = m.refreshViewport()
+		return m, tea.Batch(
+			func() tea.Msg { ch <- ""; return nil },
+			waitForStream(m.streamChan),
+		)
+	case tea.KeyEnter:
+		answer := strings.TrimSpace(m.askUserInput.Value())
+		ch := m.askUserReplyCh
+		m.askUserReplyCh = nil
+		m.askUserQuestion = ""
+		m.state = stateBusy
+		m = m.refreshViewport()
+		return m, tea.Batch(
+			func() tea.Msg { ch <- answer; return nil },
+			waitForStream(m.streamChan),
+		)
+	}
+	var cmd tea.Cmd
+	m.askUserInput, cmd = m.askUserInput.Update(msg)
+	return m, cmd
+}
+
+// viewAskUser renders the ask-user question overlay.
+func (m Model) viewAskUser() string {
+	q := m.askUserQuestion
+	if len(q) > 200 {
+		q = q[:200] + "..."
+	}
+	content := lipgloss.JoinVertical(lipgloss.Left,
+		headerStyle.Render("Agent Question"),
+		"",
+		"  "+q,
+		"",
+		"  "+m.askUserInput.View(),
+		"",
+		statusStyle.Render("  Enter to answer  •  Esc to skip  •  Ctrl+C to quit"),
+	)
+	box := helpBoxStyle.Width(min(72, m.width-4)).Render(content)
+	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, box)
+}
+
 // startMessage begins a streaming conversation turn.
 func (m Model) startMessage(text string) (tea.Model, tea.Cmd) {
 	m.viewBuf += userLabelStyle.Render("You") + ": " + text + "\n\n"
@@ -824,6 +900,8 @@ func (m Model) View() string {
 		return m.viewHelp()
 	case statePermission:
 		return m.viewPermission()
+	case stateAskUser:
+		return m.viewAskUser()
 	case stateLoginProvider:
 		return m.viewLoginProvider()
 	case stateLoginMethod:
@@ -1050,6 +1128,8 @@ func waitForStream(ch <-chan runtime.TurnEvent) tea.Cmd {
 				return streamErrMsg{err: ev.Err}
 			case runtime.TurnEventPermissionAsk:
 				return streamPermAskMsg{name: ev.ToolName, input: ev.ToolInput, reply: ev.PermReply}
+			case runtime.TurnEventAskUser:
+				return streamAskUserMsg{question: ev.ToolInput, reply: ev.AskUserReply}
 			}
 		}
 	}

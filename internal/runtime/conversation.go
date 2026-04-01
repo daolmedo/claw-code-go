@@ -38,6 +38,11 @@ func NewConversationLoop(cfg *Config, client api.APIClient) *ConversationLoop {
 			tools.WriteFileTool(),
 			tools.GlobTool(),
 			tools.GrepTool(),
+			tools.FileEditTool(),
+			tools.WebFetchTool(),
+			tools.WebSearchTool(),
+			tools.AskUserQuestionTool(),
+			tools.TodoWriteTool(),
 		},
 		Permissions: DefaultPermissions(),
 		Config:      cfg,
@@ -530,6 +535,37 @@ func (loop *ConversationLoop) runOneTurnStreaming(ctx context.Context, events ch
 				// DecisionAllow falls through to execution
 			}
 
+			// ask_user: surface the question to the caller and wait for a reply.
+			if tb.name == "ask_user" {
+				question, _ := tools.AskUserInput(inputMap)
+				if question == "" {
+					question = "?"
+				}
+				replyCh := make(chan string, 1)
+				select {
+				case events <- TurnEvent{
+					Type:         TurnEventAskUser,
+					ToolName:     tb.name,
+					ToolInput:    question,
+					AskUserReply: replyCh,
+				}:
+				case <-ctx.Done():
+					return "", 0, 0, ctx.Err()
+				}
+				var answer string
+				select {
+				case answer = <-replyCh:
+				case <-ctx.Done():
+					return "", 0, 0, ctx.Err()
+				}
+				toolResults = append(toolResults, api.ContentBlock{
+					Type:      "tool_result",
+					ToolUseID: tb.id,
+					Content:   []api.ContentBlock{{Type: "text", Text: answer}},
+				})
+				continue
+			}
+
 			select {
 			case events <- TurnEvent{Type: TurnEventToolStart, ToolName: tb.name, ToolInput: summary}:
 			case <-ctx.Done():
@@ -584,6 +620,21 @@ func (loop *ConversationLoop) ExecuteToolQuiet(name string, input map[string]any
 		result, err = tools.ExecuteGlob(input)
 	case "grep":
 		result, err = tools.ExecuteGrep(input)
+	case "file_edit":
+		result, err = tools.ExecuteFileEdit(input)
+	case "web_fetch":
+		result, err = tools.ExecuteWebFetch(input)
+	case "web_search":
+		result, err = tools.ExecuteWebSearch(input)
+	case "ask_user":
+		q, ok := tools.AskUserInput(input)
+		if !ok {
+			err = fmt.Errorf("ask_user: 'question' is required")
+		} else {
+			return tools.AskUserFallback(q)
+		}
+	case "todo_write":
+		result, err = tools.ExecuteTodoWrite(input)
 	default:
 		// Fall back to MCP registry.
 		if loop.MCPRegistry != nil {
@@ -622,7 +673,7 @@ func (loop *ConversationLoop) ExecuteToolQuiet(name string, input map[string]any
 
 // summarizeToolInput returns a short human-readable summary of tool inputs.
 func summarizeToolInput(input map[string]any) string {
-	for _, key := range []string{"command", "path", "file_path", "pattern"} {
+	for _, key := range []string{"command", "path", "file_path", "pattern", "url", "query", "question"} {
 		if v, ok := input[key].(string); ok {
 			if len(v) > 60 {
 				return v[:60] + "..."
@@ -667,6 +718,23 @@ func (loop *ConversationLoop) ExecuteTool(name string, input map[string]any) api
 		result, err = tools.ExecuteGlob(input)
 	case "grep":
 		result, err = tools.ExecuteGrep(input)
+	case "file_edit":
+		result, err = tools.ExecuteFileEdit(input)
+	case "web_fetch":
+		result, err = tools.ExecuteWebFetch(input)
+	case "web_search":
+		result, err = tools.ExecuteWebSearch(input)
+	case "ask_user":
+		q, ok := tools.AskUserInput(input)
+		if !ok {
+			err = fmt.Errorf("ask_user: 'question' is required")
+		} else {
+			cb := tools.AskUserFallback(q)
+			fmt.Fprintf(os.Stdout, "%s\n", cb.Content[0].Text)
+			return cb
+		}
+	case "todo_write":
+		result, err = tools.ExecuteTodoWrite(input)
 	default:
 		// Fall back to MCP registry.
 		if loop.MCPRegistry != nil {
