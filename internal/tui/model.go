@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"claw-code-go/internal/auth"
 	"claw-code-go/internal/runtime"
 	"context"
 	"fmt"
@@ -278,6 +279,16 @@ func (m Model) handleSlashCommand(cmd string) (tea.Model, tea.Cmd) {
 		m = m.refreshViewport()
 		return m, nil
 
+	case "/auth":
+		sub := "status"
+		if len(parts) > 1 {
+			sub = parts[1]
+		}
+		msg := m.handleAuthSubcommand(sub)
+		m.viewBuf += statusStyle.Render(msg + "\n\n")
+		m = m.refreshViewport()
+		return m, nil
+
 	case "/exit", "/quit":
 		return m, tea.Quit
 
@@ -285,6 +296,44 @@ func (m Model) handleSlashCommand(cmd string) (tea.Model, tea.Cmd) {
 		m.viewBuf += errorStyle.Render(fmt.Sprintf("Unknown command: %s  (type /help for commands)\n\n", parts[0]))
 		m = m.refreshViewport()
 		return m, nil
+	}
+}
+
+// handleAuthSubcommand executes an /auth subcommand and returns output text.
+func (m Model) handleAuthSubcommand(sub string) string {
+	switch sub {
+	case "login":
+		td, err := auth.StartOAuthFlow()
+		if err != nil {
+			return fmt.Sprintf("Auth login error: %v", err)
+		}
+		if err := auth.SaveTokens(td); err != nil {
+			return fmt.Sprintf("Login succeeded but could not save token: %v", err)
+		}
+		return "Login successful. Token saved to ~/.claw-code/auth.json"
+
+	case "logout":
+		if err := auth.ClearTokens(); err != nil {
+			return fmt.Sprintf("Logout error: %v", err)
+		}
+		return "Logged out. Stored tokens cleared."
+
+	case "status":
+		s := auth.GetStatus()
+		lines := []string{
+			fmt.Sprintf("Authenticated : %v", s.Authenticated),
+			fmt.Sprintf("Method        : %s", s.Method),
+		}
+		if s.Method == "oauth" && !s.ExpiresAt.IsZero() {
+			lines = append(lines,
+				fmt.Sprintf("Token expires : %s", s.ExpiresAt.Format("2006-01-02 15:04:05 MST")),
+				fmt.Sprintf("Has refresh   : %v", s.HasRefresh),
+			)
+		}
+		return strings.Join(lines, "\n")
+
+	default:
+		return fmt.Sprintf("Unknown auth subcommand %q. Usage: /auth login | logout | status", sub)
 	}
 }
 
@@ -320,7 +369,6 @@ func (m Model) handlePickerKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case tea.KeyEnter:
 		chosen := knownModels[m.pickerCursor]
 		m.cfg.Model = chosen.id
-		m.loop.Client.Model = chosen.id
 		m.loop.Config.Model = chosen.id
 		m.viewBuf += statusStyle.Render(fmt.Sprintf("Model changed to %s\n\n", chosen.id))
 		m.state = stateInput
@@ -427,6 +475,7 @@ func (m Model) viewHelp() string {
 		"  "+userLabelStyle.Render("/model")+"          Change the active model",
 		"  "+userLabelStyle.Render("/clear")+"          Clear session history",
 		"  "+userLabelStyle.Render("/session-list")+"   List saved sessions",
+		"  "+userLabelStyle.Render("/auth")+" login|logout|status  OAuth authentication",
 		"  "+userLabelStyle.Render("/exit")+" / "+userLabelStyle.Render("/quit")+"   Exit (session auto-saved)",
 		"",
 		"  "+userLabelStyle.Render("Ctrl+C")+"          Exit",

@@ -13,20 +13,16 @@ const systemPrompt = `You are Claude Code, an AI assistant for software engineer
 
 // ConversationLoop manages the agentic conversation loop with tool use.
 type ConversationLoop struct {
-	Client      *api.Client
+	Client      api.APIClient // provider-agnostic client interface
 	Session     *Session
 	Tools       []api.Tool
 	Permissions *Permissions
 	Config      *Config
 }
 
-// NewConversationLoop creates a new conversation loop with default tools.
-func NewConversationLoop(cfg *Config, apiKey string) *ConversationLoop {
-	client := api.NewClient(apiKey, cfg.Model)
-	if cfg.BaseURL != "" {
-		client.BaseURL = cfg.BaseURL
-	}
-
+// NewConversationLoop creates a new conversation loop with the given client.
+// Use NewProviderClient to create an appropriate client for the configured provider.
+func NewConversationLoop(cfg *Config, client api.APIClient) *ConversationLoop {
 	return &ConversationLoop{
 		Client:  client,
 		Session: NewSession(),

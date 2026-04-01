@@ -1,6 +1,8 @@
 package main
 
 import (
+	"claw-code-go/internal/auth"
+	"claw-code-go/internal/commands"
 	"claw-code-go/internal/runtime"
 	"claw-code-go/internal/tui"
 	"context"
@@ -26,9 +28,12 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Options:\n")
 		flag.PrintDefaults()
 		fmt.Fprintf(os.Stderr, "\nEnvironment variables:\n")
-		fmt.Fprintf(os.Stderr, "  ANTHROPIC_API_KEY   Anthropic API key (required)\n")
-		fmt.Fprintf(os.Stderr, "  ANTHROPIC_MODEL     Model to use (default: %s)\n", runtime.DefaultModel)
-		fmt.Fprintf(os.Stderr, "  ANTHROPIC_BASE_URL  Base URL for the API\n")
+		fmt.Fprintf(os.Stderr, "  ANTHROPIC_API_KEY        Anthropic API key (or use /auth login for OAuth)\n")
+		fmt.Fprintf(os.Stderr, "  ANTHROPIC_MODEL          Model to use (default: %s)\n", runtime.DefaultModel)
+		fmt.Fprintf(os.Stderr, "  ANTHROPIC_BASE_URL       Base URL for the API\n")
+		fmt.Fprintf(os.Stderr, "  CLAUDE_CODE_USE_BEDROCK  Set to 1 to use AWS Bedrock\n")
+		fmt.Fprintf(os.Stderr, "  CLAUDE_CODE_USE_VERTEX   Set to 1 to use Google Vertex AI\n")
+		fmt.Fprintf(os.Stderr, "  CLAUDE_CODE_USE_FOUNDRY  Set to 1 to use Azure AI Foundry\n")
 	}
 
 	flag.Parse()
@@ -42,13 +47,29 @@ func main() {
 		cfg.SessionDir = *sessionDirFlag
 	}
 
-	if cfg.APIKey == "" {
-		fmt.Fprintln(os.Stderr, "Error: ANTHROPIC_API_KEY environment variable is not set.")
-		fmt.Fprintln(os.Stderr, "Please set it to your Anthropic API key.")
+	// Resolve credentials: ANTHROPIC_API_KEY takes precedence; fall back to OAuth tokens.
+	if cfg.APIKey != "" {
+		cfg.AuthMethod = "api_key"
+	} else {
+		// Attempt to load/refresh OAuth token from ~/.claw-code/auth.json.
+		token, err := auth.GetAccessToken()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Error: no credentials found.")
+			fmt.Fprintln(os.Stderr, "Set ANTHROPIC_API_KEY, or run the TUI and use /auth login.")
+			os.Exit(1)
+		}
+		cfg.OAuthToken = token
+		cfg.AuthMethod = "oauth"
+	}
+
+	// Create the provider client (stub providers return an error here).
+	client, err := runtime.NewProviderClient(cfg)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error initialising provider %q: %v\n", cfg.ProviderName, err)
 		os.Exit(1)
 	}
 
-	loop := runtime.NewConversationLoop(cfg, cfg.APIKey)
+	loop := runtime.NewConversationLoop(cfg, client)
 
 	if *sessionFlag != "" {
 		sess, err := runtime.LoadSession(cfg.SessionDir, *sessionFlag)
@@ -86,6 +107,11 @@ func main() {
 
 // runTUI starts the Bubble Tea TUI for interactive use.
 func runTUI(cfg *runtime.Config, loop *runtime.ConversationLoop) {
+	// Register slash commands (available for future non-TUI REPL mode).
+	registry := commands.NewRegistry()
+	commands.RegisterAuthCommands(registry)
+	_ = registry
+
 	// Save session on SIGTERM (Ctrl+C is handled by Bubble Tea itself).
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGTERM)

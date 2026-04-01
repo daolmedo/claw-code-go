@@ -18,9 +18,11 @@ const (
 	anthropicVersionHeader = "anthropic-version"
 )
 
-// Client is the Anthropic API client.
+// Client is the Anthropic HTTP API client.
+// It implements the APIClient interface.
 type Client struct {
-	APIKey     string
+	APIKey     string // API key for x-api-key header auth
+	OAuthToken string // OAuth access token; takes precedence over APIKey when set
 	BaseURL    string
 	Model      string
 	HTTPClient *http.Client
@@ -52,7 +54,11 @@ func (c *Client) StreamResponse(ctx context.Context, req CreateMessageRequest) (
 		return nil, fmt.Errorf("create request: %w", err)
 	}
 
-	httpReq.Header.Set("x-api-key", c.APIKey)
+	if c.OAuthToken != "" {
+		httpReq.Header.Set("authorization", "Bearer "+c.OAuthToken)
+	} else {
+		httpReq.Header.Set("x-api-key", c.APIKey)
+	}
 	httpReq.Header.Set(anthropicVersionHeader, anthropicVersion)
 	httpReq.Header.Set("content-type", "application/json")
 	httpReq.Header.Set("accept", "text/event-stream")
