@@ -5,34 +5,33 @@ import (
 	anthropicprovider "claw-code-go/internal/api/providers/anthropic"
 	bedrockprovider "claw-code-go/internal/api/providers/bedrock"
 	foundryprovider "claw-code-go/internal/api/providers/foundry"
+	openaiprovider "claw-code-go/internal/api/providers/openai"
 	vertexprovider "claw-code-go/internal/api/providers/vertex"
-	"os"
+	"context"
+	"fmt"
 )
 
-// SelectProvider returns the Provider to use based on environment variables.
-//
-// Selection priority (first match wins):
-//   - CLAUDE_CODE_USE_BEDROCK=1  → AWS Bedrock
-//   - CLAUDE_CODE_USE_VERTEX=1   → Google Cloud Vertex AI
-//   - CLAUDE_CODE_USE_FOUNDRY=1  → Azure AI Foundry
-//   - (default)                  → Anthropic direct API
-func SelectProvider() api.Provider {
-	switch {
-	case os.Getenv("CLAUDE_CODE_USE_BEDROCK") == "1":
+// SelectProvider returns the Provider for the given name.
+// Supported names: "anthropic" (default), "openai", "bedrock", "vertex", "foundry".
+func SelectProvider(name string) api.Provider {
+	switch name {
+	case "openai":
+		return openaiprovider.New()
+	case "bedrock":
 		return bedrockprovider.New()
-	case os.Getenv("CLAUDE_CODE_USE_VERTEX") == "1":
+	case "vertex":
 		return vertexprovider.New()
-	case os.Getenv("CLAUDE_CODE_USE_FOUNDRY") == "1":
+	case "foundry":
 		return foundryprovider.New()
 	default:
 		return anthropicprovider.New()
 	}
 }
 
-// NewProviderClient creates an API client for the configured provider.
+// NewProviderClient creates an API client for the provider named in cfg.ProviderName.
 // Returns an error for stub providers that are not yet implemented.
 func NewProviderClient(cfg *Config) (api.APIClient, error) {
-	provider := SelectProvider()
+	provider := SelectProvider(cfg.ProviderName)
 	return provider.NewClient(api.ProviderConfig{
 		APIKey:     cfg.APIKey,
 		OAuthToken: cfg.OAuthToken,
@@ -40,4 +39,19 @@ func NewProviderClient(cfg *Config) (api.APIClient, error) {
 		Model:      cfg.Model,
 		MaxTokens:  cfg.MaxTokens,
 	})
+}
+
+// ----- NoAuthClient ----------------------------------------------------------
+
+// NoAuthClient is a placeholder APIClient used when no credentials are configured.
+// Every call returns a friendly error directing the user to /login.
+type NoAuthClient struct{}
+
+// NewNoAuthClient returns a NoAuthClient as an api.APIClient interface value.
+func NewNoAuthClient() api.APIClient {
+	return &NoAuthClient{}
+}
+
+func (c *NoAuthClient) StreamResponse(_ context.Context, _ api.CreateMessageRequest) (<-chan api.StreamEvent, error) {
+	return nil, fmt.Errorf("not authenticated — type /login to connect to an AI provider")
 }

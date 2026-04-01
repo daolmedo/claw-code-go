@@ -16,25 +16,61 @@ import (
 
 const appVersion = "0.1.0"
 
-// Known models available in the picker.
-var knownModels = []struct {
+// modelEntry describes a selectable AI model in the picker overlay.
+type modelEntry struct {
 	id   string
 	desc string
-}{
+}
+
+var anthropicModels = []modelEntry{
 	{"claude-opus-4-6", "Most capable — complex reasoning and analysis"},
 	{"claude-sonnet-4-6", "Balanced — great performance at speed"},
 	{"claude-haiku-4-5-20251001", "Fast and lightweight — quick tasks"},
+}
+
+var openAIModels = []modelEntry{
+	{"gpt-4o", "Most capable — multimodal tasks and analysis"},
+	{"gpt-4o-mini", "Fast and affordable — everyday tasks"},
+	{"o1-mini", "Reasoning model — math and logic"},
+}
+
+// loginProvider describes a selectable AI provider in the /login flow.
+type loginProviderEntry struct {
+	id   string
+	name string
+	desc string
+}
+
+var loginProviders = []loginProviderEntry{
+	{"anthropic", "Anthropic", "Claude Sonnet, Opus, Haiku models"},
+	{"openai", "OpenAI", "GPT-4o and GPT-4o-mini models"},
+}
+
+// loginMethodEntry describes an auth method choice shown for a given provider.
+type loginMethodEntry struct {
+	id   string
+	name string
+	desc string
+}
+
+var anthropicAuthMethods = []loginMethodEntry{
+	{"oauth", "OAuth (browser)", "Log in with your Claude.ai account"},
+	{"api_key", "API Key", "Enter your Anthropic API key manually"},
 }
 
 // appState tracks what the TUI is doing.
 type appState int
 
 const (
-	stateInput      appState = iota // waiting for user input
-	stateBusy                       // streaming response from API
-	statePicker                     // model selection overlay
-	stateHelp                       // help panel overlay
-	statePermission                 // waiting for permission decision
+	stateInput          appState = iota // waiting for user input
+	stateBusy                           // streaming response from API
+	statePicker                         // model selection overlay
+	stateHelp                           // help panel overlay
+	statePermission                     // waiting for permission decision
+	stateLoginProvider                  // /login: provider picker
+	stateLoginMethod                    // /login: auth-method picker (Anthropic)
+	stateLoginAPIKey                    // /login: API key text input
+	stateLoginOAuth                     // /login: waiting for OAuth browser flow
 )
 
 // Bubble Tea messages for async streaming events.
@@ -51,6 +87,14 @@ type (
 	}
 )
 
+// loginCompleteMsg is sent when a /login flow finishes (success or failure).
+type loginCompleteMsg struct {
+	provider string // "anthropic" or "openai"
+	token    string // API key or OAuth access token
+	method   string // "api_key" or "oauth"
+	err      error
+}
+
 // Model is the Bubble Tea application model.
 type Model struct {
 	state  appState
@@ -62,7 +106,7 @@ type Model struct {
 	input    textinput.Model
 	spinner  spinner.Model
 
-	// picker state
+	// model picker state
 	pickerCursor int
 
 	// content buffers
@@ -83,6 +127,11 @@ type Model struct {
 	permToolName  string
 	permToolInput string
 	permReplyCh   chan runtime.PermDecision
+
+	// /login flow state
+	loginCursor   int             // cursor for provider / method pickers
+	loginProvider string          // provider selected during login
+	loginKeyInput textinput.Model // API key entry input
 
 	// app deps
 	loop *runtime.ConversationLoop
@@ -147,10 +196,6 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, waitForStream(m.streamChan)
 
 	case streamToolDoneMsg:
-		preview := msg.result
-		if len(preview) > 80 {
-			preview = preview[:80] + "…"
-		}
 		line := toolStyle.Render(fmt.Sprintf("[Done: %s]\n", msg.name))
 		m.streamBuf += line
 		m = m.refreshViewport()
@@ -162,7 +207,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, waitForStream(m.streamChan)
 
 	case streamDoneMsg:
-		// Commit streamBuf to viewBuf with token annotation
+		// Commit streamBuf to viewBuf with token annotation.
 		if m.streamBuf != "" || m.hasStreamContent {
 			tokLine := statusStyle.Render(fmt.Sprintf(
 				"\n\nTokens: %s in / %s out\n\n",
@@ -194,8 +239,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m = m.refreshViewport()
 		return m, nil
 
+	case loginCompleteMsg:
+		return m.handleLoginComplete(msg)
+
 	case spinner.TickMsg:
-		if m.state == stateBusy && !m.hasStreamContent {
+		if (m.state == stateBusy && !m.hasStreamContent) || m.state == stateLoginOAuth {
 			var cmd tea.Cmd
 			m.spinner, cmd = m.spinner.Update(msg)
 			return m, cmd
@@ -215,8 +263,15 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.handleHelpKey(msg)
 	case statePermission:
 		return m.handlePermissionKey(msg)
+	case stateLoginProvider:
+		return m.handleLoginProviderKey(msg)
+	case stateLoginMethod:
+		return m.handleLoginMethodKey(msg)
+	case stateLoginAPIKey:
+		return m.handleLoginAPIKeyKey(msg)
+	case stateLoginOAuth:
+		return m.handleLoginOAuthKey(msg)
 	case stateBusy:
-		// Only allow quit during streaming
 		if msg.Type == tea.KeyCtrlC {
 			return m, tea.Quit
 		}
@@ -265,8 +320,7 @@ func (m Model) handleSlashCommand(cmd string) (tea.Model, tea.Cmd) {
 	case "/model":
 		m.state = statePicker
 		m.pickerCursor = 0
-		// Set cursor to current model
-		for i, km := range knownModels {
+		for i, km := range m.activeModels() {
 			if km.id == m.cfg.Model {
 				m.pickerCursor = i
 				break
@@ -276,6 +330,11 @@ func (m Model) handleSlashCommand(cmd string) (tea.Model, tea.Cmd) {
 
 	case "/help":
 		m.state = stateHelp
+		return m, nil
+
+	case "/login":
+		m.state = stateLoginProvider
+		m.loginCursor = 0
 		return m, nil
 
 	case "/clear":
@@ -319,7 +378,7 @@ func (m Model) handleSlashCommand(cmd string) (tea.Model, tea.Cmd) {
 	}
 }
 
-// handleAuthSubcommand executes an /auth subcommand and returns output text.
+// handleAuthSubcommand executes a legacy /auth subcommand and returns output text.
 func (m Model) handleAuthSubcommand(sub string) string {
 	switch sub {
 	case "login":
@@ -341,13 +400,14 @@ func (m Model) handleAuthSubcommand(sub string) string {
 	case "status":
 		s := auth.GetStatus()
 		lines := []string{
-			fmt.Sprintf("Authenticated : %v", s.Authenticated),
-			fmt.Sprintf("Method        : %s", s.Method),
+			fmt.Sprintf("Provider       : %s", m.cfg.ProviderName),
+			fmt.Sprintf("Authenticated  : %v", s.Authenticated),
+			fmt.Sprintf("Method         : %s", s.Method),
 		}
 		if s.Method == "oauth" && !s.ExpiresAt.IsZero() {
 			lines = append(lines,
-				fmt.Sprintf("Token expires : %s", s.ExpiresAt.Format("2006-01-02 15:04:05 MST")),
-				fmt.Sprintf("Has refresh   : %v", s.HasRefresh),
+				fmt.Sprintf("Token expires  : %s", s.ExpiresAt.Format("2006-01-02 15:04:05 MST")),
+				fmt.Sprintf("Has refresh    : %v", s.HasRefresh),
 			)
 		}
 		return strings.Join(lines, "\n")
@@ -355,6 +415,217 @@ func (m Model) handleAuthSubcommand(sub string) string {
 	default:
 		return fmt.Sprintf("Unknown auth subcommand %q. Usage: /auth login | logout | status", sub)
 	}
+}
+
+// --- /login flow ------------------------------------------------------------
+
+// handleLoginProviderKey handles key input on the provider picker screen.
+func (m Model) handleLoginProviderKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.Type {
+	case tea.KeyCtrlC:
+		return m, tea.Quit
+	case tea.KeyEsc:
+		m.state = stateInput
+		return m, nil
+	case tea.KeyUp:
+		if m.loginCursor > 0 {
+			m.loginCursor--
+		}
+		return m, nil
+	case tea.KeyDown:
+		if m.loginCursor < len(loginProviders)-1 {
+			m.loginCursor++
+		}
+		return m, nil
+	case tea.KeyEnter:
+		chosen := loginProviders[m.loginCursor]
+		m.loginProvider = chosen.id
+		m.loginCursor = 0
+
+		switch chosen.id {
+		case "anthropic":
+			// Show auth-method picker for Anthropic (OAuth or API key).
+			m.state = stateLoginMethod
+		default:
+			// For other providers (OpenAI, etc.) go straight to API key entry.
+			m = m.startAPIKeyInput()
+		}
+		return m, nil
+	}
+	return m, nil
+}
+
+// handleLoginMethodKey handles key input on the auth-method picker (Anthropic).
+func (m Model) handleLoginMethodKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.Type {
+	case tea.KeyCtrlC:
+		return m, tea.Quit
+	case tea.KeyEsc:
+		m.state = stateLoginProvider
+		m.loginCursor = 0
+		return m, nil
+	case tea.KeyUp:
+		if m.loginCursor > 0 {
+			m.loginCursor--
+		}
+		return m, nil
+	case tea.KeyDown:
+		if m.loginCursor < len(anthropicAuthMethods)-1 {
+			m.loginCursor++
+		}
+		return m, nil
+	case tea.KeyEnter:
+		chosen := anthropicAuthMethods[m.loginCursor]
+		m.loginCursor = 0
+		switch chosen.id {
+		case "oauth":
+			return m.startOAuthLogin()
+		default:
+			m = m.startAPIKeyInput()
+			return m, nil
+		}
+	}
+	return m, nil
+}
+
+// startAPIKeyInput transitions to the API key entry state.
+func (m Model) startAPIKeyInput() Model {
+	ti := textinput.New()
+	ti.Placeholder = "Paste API key and press Enter..."
+	ti.EchoMode = textinput.EchoPassword
+	ti.CharLimit = 512
+	ti.Focus()
+	m.loginKeyInput = ti
+	m.state = stateLoginAPIKey
+	return m
+}
+
+// handleLoginAPIKeyKey handles key input when the user is typing an API key.
+func (m Model) handleLoginAPIKeyKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.Type {
+	case tea.KeyCtrlC:
+		return m, tea.Quit
+	case tea.KeyEsc:
+		m.state = stateInput
+		return m, nil
+	case tea.KeyEnter:
+		apiKey := strings.TrimSpace(m.loginKeyInput.Value())
+		if apiKey == "" {
+			m.viewBuf += errorStyle.Render("API key cannot be empty.\n\n")
+			m.state = stateInput
+			m = m.refreshViewport()
+			return m, nil
+		}
+		// Save credentials and complete login.
+		saveErr := auth.SetProviderAPIKey(m.loginProvider, apiKey)
+		if saveErr != nil {
+			return m.handleLoginComplete(loginCompleteMsg{err: saveErr})
+		}
+		return m.handleLoginComplete(loginCompleteMsg{
+			provider: m.loginProvider,
+			token:    apiKey,
+			method:   "api_key",
+		})
+	}
+
+	var cmd tea.Cmd
+	m.loginKeyInput, cmd = m.loginKeyInput.Update(msg)
+	return m, cmd
+}
+
+// startOAuthLogin prepares the OAuth session (fast), shows the URL in the TUI,
+// then launches a goroutine to complete the browser flow.
+func (m Model) startOAuthLogin() (Model, tea.Cmd) {
+	session, err := auth.PrepareOAuthFlow()
+	if err != nil {
+		m.viewBuf += errorStyle.Render(fmt.Sprintf("OAuth setup failed: %v\n\n", err))
+		m.state = stateInput
+		m = m.refreshViewport()
+		return m, nil
+	}
+
+	m.state = stateLoginOAuth
+	m.viewBuf += statusStyle.Render(fmt.Sprintf(
+		"Opening browser for Anthropic OAuth login...\n"+
+			"If your browser doesn't open, visit:\n  %s\n\n"+
+			"Waiting for callback… (5-minute timeout)\n\n",
+		session.AuthURL,
+	))
+	m = m.refreshViewport()
+
+	return m, tea.Batch(
+		m.spinner.Tick,
+		func() tea.Msg {
+			td, err := session.Complete()
+			if err != nil {
+				return loginCompleteMsg{err: err}
+			}
+			if err := auth.SetProviderOAuth("anthropic", td); err != nil {
+				return loginCompleteMsg{err: fmt.Errorf("save token: %w", err)}
+			}
+			return loginCompleteMsg{
+				provider: "anthropic",
+				token:    td.AccessToken,
+				method:   "oauth",
+			}
+		},
+	)
+}
+
+// handleLoginOAuthKey lets the user Ctrl+C to abort the OAuth wait.
+func (m Model) handleLoginOAuthKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if msg.Type == tea.KeyCtrlC {
+		return m, tea.Quit
+	}
+	return m, nil
+}
+
+// handleLoginComplete is called when a /login flow finishes (success or error).
+func (m Model) handleLoginComplete(result loginCompleteMsg) (tea.Model, tea.Cmd) {
+	m.state = stateInput
+
+	if result.err != nil {
+		m.viewBuf += errorStyle.Render(fmt.Sprintf("Login failed: %v\n\n", result.err))
+		m = m.refreshViewport()
+		return m, nil
+	}
+
+	// Update config with new provider + credentials.
+	m.cfg.ProviderName = result.provider
+	m.cfg.AuthMethod = result.method
+	if result.method == "oauth" {
+		m.cfg.OAuthToken = result.token
+		m.cfg.APIKey = ""
+	} else {
+		m.cfg.APIKey = result.token
+		m.cfg.OAuthToken = ""
+	}
+
+	// Set a sensible default model for the chosen provider.
+	switch result.provider {
+	case "openai":
+		m.cfg.Model = "gpt-4o"
+	default:
+		m.cfg.Model = runtime.DefaultModel
+	}
+	m.loop.Config.Model = m.cfg.Model
+
+	// Swap in a new provider client.
+	client, err := runtime.NewProviderClient(m.cfg)
+	if err != nil {
+		m.viewBuf += errorStyle.Render(fmt.Sprintf(
+			"Login succeeded but could not create provider client: %v\n\n", err))
+		m = m.refreshViewport()
+		return m, nil
+	}
+	m.loop.Client = client
+
+	m.viewBuf += statusStyle.Render(fmt.Sprintf(
+		"Logged in to %s via %s. Model set to %s. Ready!\n\n",
+		result.provider, result.method, m.cfg.Model,
+	))
+	m = m.refreshViewport()
+	return m, nil
 }
 
 // startMessage begins a streaming conversation turn.
@@ -382,12 +653,13 @@ func (m Model) startMessage(text string) (tea.Model, tea.Cmd) {
 
 // handlePickerKey handles keys when the model picker overlay is shown.
 func (m Model) handlePickerKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	models := m.activeModels()
 	switch msg.Type {
 	case tea.KeyEsc:
 		m.state = stateInput
 		return m, nil
 	case tea.KeyEnter:
-		chosen := knownModels[m.pickerCursor]
+		chosen := models[m.pickerCursor]
 		m.cfg.Model = chosen.id
 		m.loop.Config.Model = chosen.id
 		m.viewBuf += statusStyle.Render(fmt.Sprintf("Model changed to %s\n\n", chosen.id))
@@ -400,7 +672,7 @@ func (m Model) handlePickerKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case tea.KeyDown:
-		if m.pickerCursor < len(knownModels)-1 {
+		if m.pickerCursor < len(models)-1 {
 			m.pickerCursor++
 		}
 		return m, nil
@@ -476,6 +748,14 @@ func (m Model) View() string {
 		return m.viewHelp()
 	case statePermission:
 		return m.viewPermission()
+	case stateLoginProvider:
+		return m.viewLoginProvider()
+	case stateLoginMethod:
+		return m.viewLoginMethod()
+	case stateLoginAPIKey:
+		return m.viewLoginAPIKey()
+	case stateLoginOAuth:
+		return m.viewLoginOAuth()
 	}
 
 	header := m.renderHeader()
@@ -494,7 +774,7 @@ func (m Model) View() string {
 
 func (m Model) renderHeader() string {
 	title := headerStyle.Render("Claw Code v" + appVersion)
-	tag := modelTagStyle.Render("  " + m.cfg.Model)
+	tag := modelTagStyle.Render(fmt.Sprintf("  [%s] %s", m.cfg.ProviderName, m.cfg.Model))
 	return title + tag
 }
 
@@ -509,12 +789,20 @@ func (m Model) renderStatusBar() string {
 	return statusStyle.Render("Session: " + m.loop.Session.ID)
 }
 
+// activeModels returns the model list appropriate for the current provider.
+func (m Model) activeModels() []modelEntry {
+	if m.cfg.ProviderName == "openai" {
+		return openAIModels
+	}
+	return anthropicModels
+}
+
 func (m Model) viewPicker() string {
 	var b strings.Builder
 	b.WriteString(pickerHeaderStyle.Render("Select Model") + "\n")
 	b.WriteString(statusStyle.Render("  ↑/↓ navigate  Enter select  Esc cancel") + "\n\n")
 
-	for i, km := range knownModels {
+	for i, km := range m.activeModels() {
 		cursor := "  "
 		style := unselectedModelStyle
 		if i == m.pickerCursor {
@@ -532,14 +820,15 @@ func (m Model) viewHelp() string {
 	content := lipgloss.JoinVertical(lipgloss.Left,
 		headerStyle.Render("Claw Code — Commands"),
 		"",
-		"  "+userLabelStyle.Render("/help")+"           Show this help",
-		"  "+userLabelStyle.Render("/model")+"          Change the active model",
-		"  "+userLabelStyle.Render("/clear")+"          Clear session history",
-		"  "+userLabelStyle.Render("/session-list")+"   List saved sessions",
-		"  "+userLabelStyle.Render("/auth")+" login|logout|status  OAuth authentication",
-		"  "+userLabelStyle.Render("/exit")+" / "+userLabelStyle.Render("/quit")+"   Exit (session auto-saved)",
+		"  "+userLabelStyle.Render("/login")+"                  Multi-provider login flow",
+		"  "+userLabelStyle.Render("/model")+"                  Change the active model",
+		"  "+userLabelStyle.Render("/help")+"                   Show this help",
+		"  "+userLabelStyle.Render("/clear")+"                  Clear session history",
+		"  "+userLabelStyle.Render("/session-list")+"           List saved sessions",
+		"  "+userLabelStyle.Render("/auth")+" login|logout|status  Legacy OAuth commands",
+		"  "+userLabelStyle.Render("/exit")+" / "+userLabelStyle.Render("/quit")+"           Exit (session auto-saved)",
 		"",
-		"  "+userLabelStyle.Render("Ctrl+C")+"          Exit",
+		"  "+userLabelStyle.Render("Ctrl+C")+"                  Exit",
 		"",
 		statusStyle.Render("Navigation:  ↑/↓/PgUp/PgDn to scroll  │  Esc/Enter/q to close this panel"),
 	)
@@ -563,6 +852,76 @@ func (m Model) viewPermission() string {
 		"  "+hint,
 	)
 	box := helpBoxStyle.Width(min(72, m.width-4)).Render(content)
+	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, box)
+}
+
+// viewLoginProvider renders the provider selection screen.
+func (m Model) viewLoginProvider() string {
+	var b strings.Builder
+	b.WriteString(pickerHeaderStyle.Render("Login — Choose Provider") + "\n")
+	b.WriteString(statusStyle.Render("  ↑/↓ navigate  Enter select  Esc cancel") + "\n\n")
+	for i, p := range loginProviders {
+		cursor := "  "
+		style := unselectedModelStyle
+		if i == m.loginCursor {
+			cursor = "▶ "
+			style = selectedModelStyle
+		}
+		b.WriteString(cursor + style.Render(p.name) + "\n")
+		b.WriteString("    " + statusStyle.Render(p.desc) + "\n")
+	}
+	box := helpBoxStyle.Width(min(60, m.width-4)).Render(b.String())
+	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, box)
+}
+
+// viewLoginMethod renders the auth-method selection screen (Anthropic).
+func (m Model) viewLoginMethod() string {
+	var b strings.Builder
+	b.WriteString(pickerHeaderStyle.Render("Login — Anthropic Auth Method") + "\n")
+	b.WriteString(statusStyle.Render("  ↑/↓ navigate  Enter select  Esc back") + "\n\n")
+	for i, meth := range anthropicAuthMethods {
+		cursor := "  "
+		style := unselectedModelStyle
+		if i == m.loginCursor {
+			cursor = "▶ "
+			style = selectedModelStyle
+		}
+		b.WriteString(cursor + style.Render(meth.name) + "\n")
+		b.WriteString("    " + statusStyle.Render(meth.desc) + "\n")
+	}
+	box := helpBoxStyle.Width(min(60, m.width-4)).Render(b.String())
+	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, box)
+}
+
+// viewLoginAPIKey renders the API key entry screen.
+func (m Model) viewLoginAPIKey() string {
+	providerName := m.loginProvider
+	if providerName == "" {
+		providerName = "provider"
+	}
+	content := lipgloss.JoinVertical(lipgloss.Left,
+		pickerHeaderStyle.Render(fmt.Sprintf("Login — %s API Key", strings.Title(providerName))),
+		"",
+		"  "+statusStyle.Render("Paste your API key below (input is masked):"),
+		"  "+m.loginKeyInput.View(),
+		"",
+		"  "+statusStyle.Render("Enter to confirm  •  Esc to cancel"),
+	)
+	box := helpBoxStyle.Width(min(70, m.width-4)).Render(content)
+	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, box)
+}
+
+// viewLoginOAuth renders the OAuth waiting screen.
+func (m Model) viewLoginOAuth() string {
+	content := lipgloss.JoinVertical(lipgloss.Left,
+		pickerHeaderStyle.Render("Login — Anthropic OAuth"),
+		"",
+		"  "+m.spinner.View()+" "+statusStyle.Render("Waiting for browser login…"),
+		"",
+		"  "+statusStyle.Render("Complete the login in your browser, then return here."),
+		"  "+statusStyle.Render("Ctrl+C to quit."),
+	)
+	box := helpBoxStyle.Width(min(70, m.width-4)).Render(content)
 	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, box)
 }
 

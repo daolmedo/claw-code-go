@@ -30,12 +30,13 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Options:\n")
 		flag.PrintDefaults()
 		fmt.Fprintf(os.Stderr, "\nEnvironment variables:\n")
-		fmt.Fprintf(os.Stderr, "  ANTHROPIC_API_KEY        Anthropic API key (or use /auth login for OAuth)\n")
+		fmt.Fprintf(os.Stderr, "  ANTHROPIC_API_KEY        Anthropic API key (takes precedence over stored credentials)\n")
+		fmt.Fprintf(os.Stderr, "  OPENAI_API_KEY           OpenAI API key (takes precedence over stored credentials)\n")
 		fmt.Fprintf(os.Stderr, "  ANTHROPIC_MODEL          Model to use (default: %s)\n", runtime.DefaultModel)
-		fmt.Fprintf(os.Stderr, "  ANTHROPIC_BASE_URL       Base URL for the API\n")
-		fmt.Fprintf(os.Stderr, "  CLAUDE_CODE_USE_BEDROCK  Set to 1 to use AWS Bedrock\n")
-		fmt.Fprintf(os.Stderr, "  CLAUDE_CODE_USE_VERTEX   Set to 1 to use Google Vertex AI\n")
-		fmt.Fprintf(os.Stderr, "  CLAUDE_CODE_USE_FOUNDRY  Set to 1 to use Azure AI Foundry\n")
+		fmt.Fprintf(os.Stderr, "  ANTHROPIC_BASE_URL       Base URL for the Anthropic API\n")
+		fmt.Fprintf(os.Stderr, "  CLAUDE_CODE_USE_BEDROCK  Set to 1 to use AWS Bedrock (env-var fallback)\n")
+		fmt.Fprintf(os.Stderr, "  CLAUDE_CODE_USE_VERTEX   Set to 1 to use Google Vertex AI (env-var fallback)\n")
+		fmt.Fprintf(os.Stderr, "  CLAUDE_CODE_USE_FOUNDRY  Set to 1 to use Azure AI Foundry (env-var fallback)\n")
 	}
 
 	flag.Parse()
@@ -49,31 +50,36 @@ func main() {
 		cfg.SessionDir = *sessionDirFlag
 	}
 
-	// Resolve credentials: ANTHROPIC_API_KEY takes precedence; fall back to OAuth tokens.
-	if cfg.APIKey != "" {
-		cfg.AuthMethod = "api_key"
-	} else {
-		// Attempt to load/refresh OAuth token from ~/.claw-code/auth.json.
-		token, err := auth.GetAccessToken()
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "Error: no credentials found.")
-			fmt.Fprintln(os.Stderr, "Set ANTHROPIC_API_KEY, or run the TUI and use /auth login.")
-			os.Exit(1)
+	// Resolve credentials using the multi-provider credential store.
+	// Env vars take precedence (ANTHROPIC_API_KEY, OPENAI_API_KEY).
+	// Falls back gracefully so the TUI can start and prompt the user to /login.
+	provider, token, authMethod, credErr := auth.ResolveCredentials()
+	if credErr == nil {
+		cfg.ProviderName = provider
+		cfg.AuthMethod = authMethod
+		if authMethod == "oauth" {
+			cfg.OAuthToken = token
+		} else {
+			cfg.APIKey = token
 		}
-		cfg.OAuthToken = token
-		cfg.AuthMethod = "oauth"
+	} else {
+		// No credentials found — start with NoAuthClient so the TUI still opens.
+		// The user can run /login inside the TUI.
+		fmt.Fprintf(os.Stderr, "Note: no credentials found (%v).\n", credErr)
+		fmt.Fprintln(os.Stderr, "      Use /login in the TUI to authenticate.")
 	}
 
-	// Create the provider client (stub providers return an error here).
-	client, err := runtime.NewProviderClient(cfg)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error initialising provider %q: %v\n", cfg.ProviderName, err)
-		os.Exit(1)
+	// Create the provider client (or a no-auth placeholder).
+	realClient, clientErr := runtime.NewProviderClient(cfg)
+	if clientErr != nil {
+		fmt.Fprintf(os.Stderr, "Note: could not create %s client: %v\n", cfg.ProviderName, clientErr)
+		fmt.Fprintln(os.Stderr, "      Use /login in the TUI to authenticate.")
+		realClient = runtime.NewNoAuthClient()
 	}
 
-	loop := runtime.NewConversationLoop(cfg, client)
+	loop := runtime.NewConversationLoop(cfg, realClient)
 
-	// Wire up the Phase 5 permission manager.
+	// Wire up the permission manager (Phase 5).
 	permMode, err := permissions.ParsePermissionMode(*permModeFlag)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: %v; using default mode\n", err)
@@ -81,12 +87,11 @@ func main() {
 	}
 	ruleset, rErr := permissions.LoadRuleset(".claude/settings.json")
 	if rErr != nil {
-		fmt.Fprintf(os.Stderr, "Warning: could not load .claude/settings.json: %v\n", rErr)
 		ruleset = &permissions.Ruleset{}
 	}
 	loop.PermManager = permissions.NewManager(permMode, ruleset)
 
-	// Connect to MCP servers defined in config (non-fatal errors are printed).
+	// Connect to MCP servers defined in config (non-fatal errors printed inside).
 	loop.InitMCPFromConfig(context.Background())
 
 	if *sessionFlag != "" {
@@ -101,6 +106,11 @@ func main() {
 
 	// Single prompt (non-interactive) mode — no TUI, plain stdout streaming.
 	if *promptFlag != "" {
+		if credErr != nil {
+			fmt.Fprintln(os.Stderr, "Error: cannot use --prompt without valid credentials.")
+			fmt.Fprintln(os.Stderr, "Set ANTHROPIC_API_KEY or OPENAI_API_KEY, or run the TUI and use /login.")
+			os.Exit(1)
+		}
 		sigCh := make(chan os.Signal, 1)
 		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 		go func() {

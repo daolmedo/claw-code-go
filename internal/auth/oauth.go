@@ -208,3 +208,96 @@ func postTokenRequest(v url.Values) (*TokenData, error) {
 func openBrowser(u string) {
 	exec.Command("xdg-open", u).Start() //nolint:errcheck
 }
+
+// OAuthSession holds state for an in-progress OAuth flow that has been prepared
+// (PKCE generated, loopback listener started) but not yet completed.
+// Use PrepareOAuthFlow to create one, then call Complete to open the browser
+// and wait for the redirect.
+type OAuthSession struct {
+	// AuthURL is the full authorization URL. The TUI displays this so users
+	// can copy-paste it if the browser does not open automatically.
+	AuthURL     string
+	listener    net.Listener
+	redirectURI string
+	pkce        PKCEPair
+	state       string
+}
+
+// PrepareOAuthFlow initialises a new OAuth session: generates a PKCE pair,
+// starts a loopback TCP listener on an OS-assigned port, and builds the
+// authorization URL — without opening the browser yet.
+func PrepareOAuthFlow() (*OAuthSession, error) {
+	pkce, err := GeneratePKCEPair()
+	if err != nil {
+		return nil, err
+	}
+	state, err := generateState()
+	if err != nil {
+		return nil, err
+	}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return nil, fmt.Errorf("start loopback listener: %w", err)
+	}
+	port := listener.Addr().(*net.TCPAddr).Port
+	redirectURI := fmt.Sprintf("http://127.0.0.1:%d/callback", port)
+	authURL := buildAuthURL(redirectURI, pkce.Challenge, state)
+	return &OAuthSession{
+		AuthURL:     authURL,
+		listener:    listener,
+		redirectURI: redirectURI,
+		pkce:        pkce,
+		state:       state,
+	}, nil
+}
+
+// Complete opens the browser to AuthURL and blocks until the OAuth callback is
+// received or a 5-minute timeout elapses. The caller should persist the
+// returned TokenData with SetProviderOAuth or SaveTokens.
+func (s *OAuthSession) Complete() (*TokenData, error) {
+	type callbackResult struct {
+		code  string
+		state string
+		err   error
+	}
+	resultCh := make(chan callbackResult, 1)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/callback", func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		if errCode := q.Get("error"); errCode != "" {
+			desc := q.Get("error_description")
+			resultCh <- callbackResult{err: fmt.Errorf("authorization error %q: %s", errCode, desc)}
+			http.Error(w, "Authentication failed. You may close this window.", http.StatusBadRequest)
+			return
+		}
+		resultCh <- callbackResult{code: q.Get("code"), state: q.Get("state")}
+		fmt.Fprint(w, `<html><body style="font-family:sans-serif;max-width:480px;margin:4rem auto">
+<h2>Authentication successful!</h2>
+<p>You may close this window and return to claw-code.</p>
+</body></html>`)
+	})
+
+	srv := &http.Server{Handler: mux}
+	go srv.Serve(s.listener) //nolint:errcheck
+	defer srv.Shutdown(context.Background()) //nolint:errcheck
+
+	openBrowser(s.AuthURL)
+
+	timer := time.NewTimer(5 * time.Minute)
+	defer timer.Stop()
+
+	var result callbackResult
+	select {
+	case result = <-resultCh:
+	case <-timer.C:
+		return nil, fmt.Errorf("oauth timeout: authorization not completed within 5 minutes")
+	}
+	if result.err != nil {
+		return nil, result.err
+	}
+	if result.state != s.state {
+		return nil, fmt.Errorf("oauth state mismatch: possible CSRF attack, aborting")
+	}
+	return ExchangeCode(result.code, s.pkce.Verifier, s.redirectURI)
+}
