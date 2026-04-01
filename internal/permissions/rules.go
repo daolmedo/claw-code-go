@@ -55,16 +55,25 @@ func (rs *Ruleset) Match(tool, input string) (Decision, bool) {
 }
 
 // settingsFile is the on-disk format for .claude/settings.json.
+// It supports both a structured "rules" array and the simpler
+// "allowedTools" / "blockedTools" lists.
 type settingsFile struct {
 	Rules []struct {
 		Tool     string `json:"tool"`
 		Pattern  string `json:"pattern"`
 		Decision string `json:"decision"`
 	} `json:"rules"`
+	// allowedTools are tool names that are always permitted without prompting.
+	AllowedTools []string `json:"allowedTools"`
+	// blockedTools are tool names that are always denied without prompting.
+	BlockedTools []string `json:"blockedTools"`
 }
 
 // LoadRuleset reads .claude/settings.json relative to the current directory.
 // If the file does not exist an empty (no-op) ruleset is returned without error.
+//
+// Precedence within the file: explicit "rules" entries are matched first, then
+// "allowedTools", then "blockedTools".
 func LoadRuleset(path string) (*Ruleset, error) {
 	data, err := os.ReadFile(path)
 	if os.IsNotExist(err) {
@@ -80,6 +89,8 @@ func LoadRuleset(path string) (*Ruleset, error) {
 	}
 
 	rs := &Ruleset{}
+
+	// Structured rules (first-match wins, evaluated before allow/block lists).
 	for _, raw := range sf.Rules {
 		r := Rule{
 			Tool:    raw.Tool,
@@ -95,5 +106,35 @@ func LoadRuleset(path string) (*Ruleset, error) {
 		}
 		rs.Rules = append(rs.Rules, r)
 	}
+
+	// allowedTools shorthand: one allow rule per tool, no pattern.
+	for _, tool := range sf.AllowedTools {
+		rs.Rules = append(rs.Rules, Rule{
+			Tool:     tool,
+			Decision: DecisionAllow,
+		})
+	}
+
+	// blockedTools shorthand: one deny rule per tool, no pattern.
+	for _, tool := range sf.BlockedTools {
+		rs.Rules = append(rs.Rules, Rule{
+			Tool:     tool,
+			Decision: DecisionDeny,
+		})
+	}
+
 	return rs, nil
+}
+
+// RulesetFromLists builds a Ruleset from plain allow/deny tool name slices.
+// Allowed rules are prepended before denied rules so allow wins on conflict.
+func RulesetFromLists(allowedTools, blockedTools []string) *Ruleset {
+	rs := &Ruleset{}
+	for _, tool := range allowedTools {
+		rs.Rules = append(rs.Rules, Rule{Tool: tool, Decision: DecisionAllow})
+	}
+	for _, tool := range blockedTools {
+		rs.Rules = append(rs.Rules, Rule{Tool: tool, Decision: DecisionDeny})
+	}
+	return rs
 }

@@ -38,6 +38,8 @@ func CheckPermission(perm *Permissions, tool string) bool {
 	case "grep":
 		return perm.AllowGrep
 	default:
-		return false
+		// Allow unknown tools (file_edit, web_fetch, web_search, ask_user,
+		// todo_write, MCP tools, etc.); PermManager handles the real gating.
+		return true
 	}
 }

@@ -1,6 +1,7 @@
 package runtime
 
 import (
+	"claw-code-go/internal/config"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -50,26 +51,63 @@ type Config struct {
 	// CompactionKeepRecent is the number of most-recent messages retained
 	// verbatim after compaction.
 	CompactionKeepRecent int
+
+	// Permission settings (Phase 11).
+	// PermissionMode is the active permission enforcement mode string.
+	PermissionMode string
+	// AllowedTools are tool names that are always allowed without prompting.
+	AllowedTools []string
+	// BlockedTools are tool names that are always denied without prompting.
+	BlockedTools []string
+
+	// Theme is the active TUI color theme ("dark" or "light").
+	Theme string
 }
 
-// LoadConfig reads configuration from environment variables and applies defaults.
+// LoadConfig reads configuration from layered settings files and environment
+// variables and applies defaults. Load order (later overrides earlier):
+//  1. Defaults
+//  2. Layered settings files (user global → project → local)
+//  3. Environment variables
+//  4. CLI flags (applied by the caller after this function returns)
 func LoadConfig() *Config {
 	cfg := &Config{
 		Model:                DefaultModel,
 		MaxTokens:            DefaultMaxTokens,
+		PermissionMode:       "default",
 		CompactionEnabled:    true,
 		CompactionThreshold:  DefaultCompactionThreshold,
 		CompactionKeepRecent: DefaultCompactionKeepRecent,
 	}
 
+	// Apply layered settings files (user global → project → local).
+	s := config.Load()
+	if s.Model != "" {
+		cfg.Model = s.Model
+	}
+	if s.MaxTokens != 0 {
+		cfg.MaxTokens = s.MaxTokens
+	}
+	if s.PermissionMode != "" {
+		cfg.PermissionMode = s.PermissionMode
+	}
+	if len(s.AllowedTools) > 0 {
+		cfg.AllowedTools = s.AllowedTools
+	}
+	if len(s.BlockedTools) > 0 {
+		cfg.BlockedTools = s.BlockedTools
+	}
+	if s.Theme != "" {
+		cfg.Theme = s.Theme
+	}
+
+	// Environment variables override settings files.
 	if key := os.Getenv("ANTHROPIC_API_KEY"); key != "" {
 		cfg.APIKey = key
 	}
-
 	if model := os.Getenv("ANTHROPIC_MODEL"); model != "" {
 		cfg.Model = model
 	}
-
 	if baseURL := os.Getenv("ANTHROPIC_BASE_URL"); baseURL != "" {
 		cfg.BaseURL = baseURL
 	}

@@ -2,9 +2,11 @@ package tui
 
 import (
 	"claw-code-go/internal/auth"
+	"claw-code-go/internal/config"
 	"claw-code-go/internal/runtime"
 	"context"
 	"fmt"
+	"os"
 	"strings"
 
 	"github.com/charmbracelet/bubbles/spinner"
@@ -475,6 +477,21 @@ func (m Model) handleSlashCommand(cmd string) (tea.Model, tea.Cmd) {
 		m = m.refreshViewport()
 		return m, nil
 
+	case "/session":
+		return m.handleSessionCommand(parts)
+
+	case "/status":
+		return m.handleStatus()
+
+	case "/init":
+		return m.handleInit()
+
+	case "/cost":
+		return m.handleCost()
+
+	case "/config":
+		return m.handleConfig(parts)
+
 	case "/exit", "/quit":
 		return m, tea.Quit
 
@@ -483,6 +500,192 @@ func (m Model) handleSlashCommand(cmd string) (tea.Model, tea.Cmd) {
 		m = m.refreshViewport()
 		return m, nil
 	}
+}
+
+// handleSessionCommand handles /session list|save|load <name>.
+func (m Model) handleSessionCommand(parts []string) (tea.Model, tea.Cmd) {
+	sub := "list"
+	if len(parts) > 1 {
+		sub = parts[1]
+	}
+	switch sub {
+	case "list":
+		sessions, err := m.loop.ListSessions()
+		if err != nil {
+			m.viewBuf += errorStyle.Render(fmt.Sprintf("Error listing sessions: %v\n\n", err))
+		} else if len(sessions) == 0 {
+			m.viewBuf += statusStyle.Render("No saved sessions.\n\n")
+		} else {
+			m.viewBuf += statusStyle.Render("Saved sessions:\n  "+strings.Join(sessions, "\n  ")+"\n\n")
+		}
+	case "save":
+		name := ""
+		if len(parts) > 2 {
+			name = parts[2]
+		}
+		if name != "" {
+			m.loop.Session.ID = name
+		}
+		if err := m.loop.SaveCurrentSession(); err != nil {
+			m.viewBuf += errorStyle.Render(fmt.Sprintf("Error saving session: %v\n\n", err))
+		} else {
+			m.viewBuf += statusStyle.Render(fmt.Sprintf("Session saved: %s\n\n", m.loop.Session.ID))
+		}
+	case "load":
+		if len(parts) < 3 {
+			m.viewBuf += errorStyle.Render("Usage: /session load <name>\n\n")
+		} else {
+			id := parts[2]
+			if err := m.loop.LoadNamedSession(id); err != nil {
+				m.viewBuf += errorStyle.Render(fmt.Sprintf("Error loading session %q: %v\n\n", id, err))
+			} else {
+				m.viewBuf += statusStyle.Render(fmt.Sprintf("Session loaded: %s (%d messages)\n\n", id, m.loop.MessageCount()))
+			}
+		}
+	default:
+		m.viewBuf += errorStyle.Render(fmt.Sprintf("Unknown /session subcommand %q. Usage: /session list|save|load <name>\n\n", sub))
+	}
+	m = m.refreshViewport()
+	return m, nil
+}
+
+// handleStatus shows current model, provider, permission mode, and session info.
+func (m Model) handleStatus() (tea.Model, tea.Cmd) {
+	permMode := "default"
+	if m.cfg.PermissionMode != "" {
+		permMode = m.cfg.PermissionMode
+	}
+	if m.loop.PermManager != nil {
+		permMode = m.loop.PermManager.Mode.String()
+	}
+	lines := []string{
+		fmt.Sprintf("Provider       : %s", m.cfg.ProviderName),
+		fmt.Sprintf("Model          : %s", m.cfg.Model),
+		fmt.Sprintf("Permission mode: %s", permMode),
+		fmt.Sprintf("Session ID     : %s", m.loop.Session.ID),
+		fmt.Sprintf("Messages       : %d", m.loop.MessageCount()),
+		fmt.Sprintf("Tokens in/out  : %s / %s", formatNum(m.inputTokens), formatNum(m.outputTokens)),
+	}
+	m.viewBuf += statusStyle.Render(strings.Join(lines, "\n")+"\n\n")
+	m = m.refreshViewport()
+	return m, nil
+}
+
+// handleInit creates .claude/settings.json with defaults.
+func (m Model) handleInit() (tea.Model, tea.Cmd) {
+	err := config.InitProject(m.cfg.Model)
+	switch {
+	case err == nil:
+		m.viewBuf += statusStyle.Render("Created .claude/settings.json with defaults.\n\n")
+	case os.IsExist(err):
+		m.viewBuf += statusStyle.Render(".claude/settings.json already exists — no changes made.\n\n")
+	default:
+		m.viewBuf += errorStyle.Render(fmt.Sprintf("init: %v\n\n", err))
+	}
+	m = m.refreshViewport()
+	return m, nil
+}
+
+// handleCost shows estimated token usage so far.
+func (m Model) handleCost() (tea.Model, tea.Cmd) {
+	compaction := m.loop.Compaction
+	lines := []string{
+		fmt.Sprintf("Input tokens   : %s", formatNum(compaction.TotalInputTokens+m.inputTokens)),
+		fmt.Sprintf("Output tokens  : %s", formatNum(compaction.TotalOutputTokens+m.outputTokens)),
+		fmt.Sprintf("Compactions    : %d", compaction.CompactionCount),
+		"(Cost estimates require model pricing lookup — not yet implemented)",
+	}
+	m.viewBuf += statusStyle.Render(strings.Join(lines, "\n")+"\n\n")
+	m = m.refreshViewport()
+	return m, nil
+}
+
+// handleConfig handles /config [key [value]].
+func (m Model) handleConfig(parts []string) (tea.Model, tea.Cmd) {
+	if len(parts) == 1 {
+		// Show all config.
+		permMode := m.cfg.PermissionMode
+		if permMode == "" {
+			permMode = "default"
+		}
+		lines := []string{
+			fmt.Sprintf("model          = %s", m.cfg.Model),
+			fmt.Sprintf("permissionMode = %s", permMode),
+			fmt.Sprintf("maxTokens      = %d", m.cfg.MaxTokens),
+			fmt.Sprintf("theme          = %s", m.cfg.Theme),
+		}
+		m.viewBuf += statusStyle.Render(strings.Join(lines, "\n")+"\n\n")
+		m = m.refreshViewport()
+		return m, nil
+	}
+
+	key := parts[1]
+	if len(parts) == 2 {
+		// Show single key.
+		val := m.configGet(key)
+		if val == "" {
+			m.viewBuf += errorStyle.Render(fmt.Sprintf("Unknown config key: %s\n\n", key))
+		} else {
+			m.viewBuf += statusStyle.Render(fmt.Sprintf("%s = %s\n\n", key, val))
+		}
+		m = m.refreshViewport()
+		return m, nil
+	}
+
+	// Set value.
+	value := strings.Join(parts[2:], " ")
+	if err := m.configSet(key, value); err != nil {
+		m.viewBuf += errorStyle.Render(fmt.Sprintf("config set: %v\n\n", err))
+	} else {
+		m.viewBuf += statusStyle.Render(fmt.Sprintf("Set %s = %s\n\n", key, value))
+	}
+	m = m.refreshViewport()
+	return m, nil
+}
+
+// configGet returns the string value of a config key from the active Config.
+func (m Model) configGet(key string) string {
+	switch key {
+	case "model":
+		return m.cfg.Model
+	case "permissionMode":
+		if m.cfg.PermissionMode == "" {
+			return "default"
+		}
+		return m.cfg.PermissionMode
+	case "maxTokens":
+		return fmt.Sprintf("%d", m.cfg.MaxTokens)
+	case "theme":
+		return m.cfg.Theme
+	default:
+		return ""
+	}
+}
+
+// configSet updates a config key in-memory and persists to project settings.json.
+func (m *Model) configSet(key, value string) error {
+	s := &config.Settings{}
+	switch key {
+	case "model":
+		m.cfg.Model = value
+		m.loop.Config.Model = value
+		s.Model = value
+	case "permissionMode":
+		m.cfg.PermissionMode = value
+		s.PermissionMode = value
+	case "theme":
+		m.cfg.Theme = value
+		s.Theme = value
+		switch value {
+		case "light":
+			SetTheme(LightTheme)
+		default:
+			SetTheme(DarkTheme)
+		}
+	default:
+		return fmt.Errorf("unknown config key %q (valid: model, permissionMode, theme)", key)
+	}
+	return config.WriteProject(s)
 }
 
 // handleAuthSubcommand executes a legacy /auth subcommand and returns output text.
@@ -992,14 +1195,30 @@ func (m Model) viewHelp() string {
 	content := lipgloss.JoinVertical(lipgloss.Left,
 		headerStyle.Render("Claw Code — Commands"),
 		"",
-		"  "+userLabelStyle.Render("/login")+"                     Multi-provider login flow",
-		"  "+userLabelStyle.Render("/model")+"                     Change the active model",
-		"  "+userLabelStyle.Render("/theme")+" dark|light           Switch TUI color theme",
-		"  "+userLabelStyle.Render("/help")+"                      Show this help",
-		"  "+userLabelStyle.Render("/clear")+"                     Clear session history",
-		"  "+userLabelStyle.Render("/session-list")+"              List saved sessions",
-		"  "+userLabelStyle.Render("/auth")+" login|logout|status  Legacy OAuth commands",
-		"  "+userLabelStyle.Render("/exit")+" / "+userLabelStyle.Render("/quit")+"              Exit (session auto-saved)",
+		statusStyle.Render("Auth & Provider"),
+		"  "+userLabelStyle.Render("/login")+"                          Multi-provider login flow",
+		"  "+userLabelStyle.Render("/auth")+" login|logout|status       Legacy OAuth commands",
+		"",
+		statusStyle.Render("Model & Config"),
+		"  "+userLabelStyle.Render("/model")+"                          Change the active model (picker)",
+		"  "+userLabelStyle.Render("/config")+"                         Show all config values",
+		"  "+userLabelStyle.Render("/config")+" <key>                   Show one config value",
+		"  "+userLabelStyle.Render("/config")+" <key> <value>           Set config value (saves to project)",
+		"  "+userLabelStyle.Render("/init")+"                           Create .claude/settings.json",
+		"  "+userLabelStyle.Render("/theme")+" dark|light               Switch TUI color theme",
+		"  "+userLabelStyle.Render("/status")+"                         Show model/provider/session info",
+		"  "+userLabelStyle.Render("/cost")+"                           Show token usage this session",
+		"",
+		statusStyle.Render("Session"),
+		"  "+userLabelStyle.Render("/clear")+"                          Clear conversation history",
+		"  "+userLabelStyle.Render("/session")+" list                   List saved sessions",
+		"  "+userLabelStyle.Render("/session")+" save [name]            Save current session",
+		"  "+userLabelStyle.Render("/session")+" load <name>            Load a saved session",
+		"  "+userLabelStyle.Render("/session-list")+"                   Alias for /session list",
+		"",
+		statusStyle.Render("Other"),
+		"  "+userLabelStyle.Render("/help")+"                           Show this help",
+		"  "+userLabelStyle.Render("/exit")+" / "+userLabelStyle.Render("/quit")+"                     Exit (session auto-saved)",
 		"",
 		statusStyle.Render("Input:"),
 		"  "+userLabelStyle.Render("Enter")+"          Send message",
@@ -1010,7 +1229,7 @@ func (m Model) viewHelp() string {
 		"",
 		statusStyle.Render("Esc / Enter / q to close this panel"),
 	)
-	box := helpBoxStyle.Width(min(76, m.width-4)).Render(content)
+	box := helpBoxStyle.Width(min(80, m.width-4)).Render(content)
 	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, box)
 }
 

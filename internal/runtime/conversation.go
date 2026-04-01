@@ -694,6 +694,29 @@ func (loop *ConversationLoop) ListSessions() ([]string, error) {
 	return ListSessions(loop.Config.SessionDir)
 }
 
+// SaveCurrentSession persists the active session to disk.
+func (loop *ConversationLoop) SaveCurrentSession() error {
+	return SaveSession(loop.Config.SessionDir, loop.Session)
+}
+
+// LoadNamedSession replaces the active session with one loaded from disk by ID.
+func (loop *ConversationLoop) LoadNamedSession(id string) error {
+	sess, err := LoadSession(loop.Config.SessionDir, id)
+	if err != nil {
+		return err
+	}
+	loop.Session = sess
+	return nil
+}
+
+// MessageCount returns the number of messages in the active session.
+func (loop *ConversationLoop) MessageCount() int {
+	if loop.Session == nil {
+		return 0
+	}
+	return len(loop.Session.Messages)
+}
+
 // ExecuteTool dispatches to the appropriate tool implementation.
 func (loop *ConversationLoop) ExecuteTool(name string, input map[string]any) api.ContentBlock {
 	if !CheckPermission(loop.Permissions, name) {

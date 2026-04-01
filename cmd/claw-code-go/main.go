@@ -103,15 +103,28 @@ func main() {
 
 	loop := runtime.NewConversationLoop(cfg, realClient)
 
-	// Wire up the permission manager (Phase 5).
-	permMode, err := permissions.ParsePermissionMode(*permModeFlag)
+	// Wire up the permission manager (Phase 11).
+	// CLI --permission-mode flag overrides the config-file value when set to a
+	// non-default value. cfg.PermissionMode comes from the layered settings files.
+	resolvedPermMode := cfg.PermissionMode
+	if *permModeFlag != "default" {
+		resolvedPermMode = *permModeFlag
+	}
+	permMode, err := permissions.ParsePermissionMode(resolvedPermMode)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: %v; using default mode\n", err)
 		permMode = permissions.ModeDefault
 	}
+	cfg.PermissionMode = permMode.String() // normalise back into Config
+
 	ruleset, rErr := permissions.LoadRuleset(".claude/settings.json")
 	if rErr != nil {
 		ruleset = &permissions.Ruleset{}
+	}
+	// Merge allowedTools/blockedTools from layered config into the ruleset.
+	if len(cfg.AllowedTools) > 0 || len(cfg.BlockedTools) > 0 {
+		extra := permissions.RulesetFromLists(cfg.AllowedTools, cfg.BlockedTools)
+		ruleset.Rules = append(ruleset.Rules, extra.Rules...)
 	}
 	loop.PermManager = permissions.NewManager(permMode, ruleset)
 
