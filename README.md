@@ -1,5 +1,9 @@
 # claw-code-go
 
+<p align="center">
+  <img src="assets/claw-code-go.png" alt="claw-code-go logo" width="320" />
+</p>
+
 A Go port of Claude Code — the Anthropic CLI coding assistant.
 
 ## Workspace Layout
