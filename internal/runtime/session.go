@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 )
@@ -23,6 +24,11 @@ type Session struct {
 	CompactionSummary string `json:"compaction_summary,omitempty"`
 	// CompactionCount is the number of times this session has been compacted.
 	CompactionCount int `json:"compaction_count,omitempty"`
+
+	// Usage tracking (Phase 13). Persisted so cost history survives resume.
+	TotalInputTokens  int `json:"total_input_tokens,omitempty"`
+	TotalOutputTokens int `json:"total_output_tokens,omitempty"`
+	TotalTurns        int `json:"total_turns,omitempty"`
 }
 
 // NewSession creates a new session with a unique ID based on timestamp.
@@ -96,4 +102,43 @@ func ListSessions(dir string) ([]string, error) {
 	}
 
 	return ids, nil
+}
+
+// SessionMeta holds lightweight metadata for a saved session without loading
+// the full message slice.
+type SessionMeta struct {
+	ID                string
+	UpdatedAt         time.Time
+	MessageCount      int
+	TotalInputTokens  int
+	TotalOutputTokens int
+	TotalTurns        int
+}
+
+// ListSessionsWithMeta returns metadata for all saved sessions, sorted newest
+// first. Sessions that cannot be parsed are silently skipped.
+func ListSessionsWithMeta(dir string) ([]SessionMeta, error) {
+	ids, err := ListSessions(dir)
+	if err != nil {
+		return nil, err
+	}
+	var metas []SessionMeta
+	for _, id := range ids {
+		s, err := LoadSession(dir, id)
+		if err != nil {
+			continue
+		}
+		metas = append(metas, SessionMeta{
+			ID:                id,
+			UpdatedAt:         s.UpdatedAt,
+			MessageCount:      len(s.Messages),
+			TotalInputTokens:  s.TotalInputTokens,
+			TotalOutputTokens: s.TotalOutputTokens,
+			TotalTurns:        s.TotalTurns,
+		})
+	}
+	sort.Slice(metas, func(i, j int) bool {
+		return metas[i].UpdatedAt.After(metas[j].UpdatedAt)
+	})
+	return metas, nil
 }

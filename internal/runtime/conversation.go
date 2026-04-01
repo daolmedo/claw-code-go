@@ -6,6 +6,7 @@ import (
 	"claw-code-go/internal/mcp"
 	"claw-code-go/internal/permissions"
 	"claw-code-go/internal/tools"
+	"claw-code-go/internal/usage"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -26,6 +27,7 @@ type ConversationLoop struct {
 	MCPRegistry     *mcp.Registry         // MCP server registry (may be nil)
 	Compaction      CompactionState        // Phase 6 token tracking and compaction state
 	CtxAssembler    *clawctx.Assembler    // Phase 12 context assembler (may be nil)
+	Usage           *usage.Tracker        // Phase 13 per-session token usage tracker
 }
 
 // NewConversationLoop creates a new conversation loop with the given client.
@@ -50,6 +52,7 @@ func NewConversationLoop(cfg *Config, client api.APIClient) *ConversationLoop {
 		Permissions:  DefaultPermissions(),
 		Config:       cfg,
 		CtxAssembler: clawctx.NewAssembler(workDir),
+		Usage:        usage.NewTracker(cfg.Model),
 	}
 }
 
@@ -342,6 +345,11 @@ func (loop *ConversationLoop) SendMessageStreaming(ctx context.Context, userText
 	loop.Compaction.LastInputTokens = totalInput
 	loop.Compaction.TotalInputTokens += totalInput
 	loop.Compaction.TotalOutputTokens += totalOutput
+
+	// Update the usage tracker (Phase 13).
+	if loop.Usage != nil {
+		loop.Usage.Add(totalInput, totalOutput, 0, 0)
+	}
 
 	events <- TurnEvent{
 		Type:         TurnEventUsage,
@@ -705,19 +713,35 @@ func (loop *ConversationLoop) ListSessions() ([]string, error) {
 	return ListSessions(loop.Config.SessionDir)
 }
 
-// SaveCurrentSession persists the active session to disk.
+// SaveCurrentSession persists the active session to disk, including usage data.
 func (loop *ConversationLoop) SaveCurrentSession() error {
+	if loop.Usage != nil {
+		loop.Session.TotalInputTokens = loop.Usage.TotalInput
+		loop.Session.TotalOutputTokens = loop.Usage.TotalOutput
+		loop.Session.TotalTurns = loop.Usage.Turns
+	}
 	return SaveSession(loop.Config.SessionDir, loop.Session)
 }
 
 // LoadNamedSession replaces the active session with one loaded from disk by ID.
+// Usage tracker state is restored from persisted session data.
 func (loop *ConversationLoop) LoadNamedSession(id string) error {
 	sess, err := LoadSession(loop.Config.SessionDir, id)
 	if err != nil {
 		return err
 	}
 	loop.Session = sess
+	if loop.Usage != nil && sess.TotalTurns > 0 {
+		loop.Usage.TotalInput = sess.TotalInputTokens
+		loop.Usage.TotalOutput = sess.TotalOutputTokens
+		loop.Usage.Turns = sess.TotalTurns
+	}
 	return nil
+}
+
+// ListSessionsWithMeta returns metadata for all saved sessions, sorted newest first.
+func (loop *ConversationLoop) ListSessionsWithMeta() ([]SessionMeta, error) {
+	return ListSessionsWithMeta(loop.Config.SessionDir)
 }
 
 // MessageCount returns the number of messages in the active session.

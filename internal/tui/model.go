@@ -440,13 +440,13 @@ func (m Model) handleSlashCommand(cmd string) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case "/session-list":
-		sessions, err := m.loop.ListSessions()
+		metas, err := m.loop.ListSessionsWithMeta()
 		if err != nil {
 			m.viewBuf += errorStyle.Render(fmt.Sprintf("Error listing sessions: %v\n\n", err))
-		} else if len(sessions) == 0 {
+		} else if len(metas) == 0 {
 			m.viewBuf += statusStyle.Render("No saved sessions.\n\n")
 		} else {
-			m.viewBuf += statusStyle.Render("Saved sessions:\n  " + strings.Join(sessions, "\n  ") + "\n\n")
+			m.viewBuf += statusStyle.Render(formatSessionList(metas) + "\n\n")
 		}
 		m = m.refreshViewport()
 		return m, nil
@@ -510,13 +510,13 @@ func (m Model) handleSessionCommand(parts []string) (tea.Model, tea.Cmd) {
 	}
 	switch sub {
 	case "list":
-		sessions, err := m.loop.ListSessions()
+		metas, err := m.loop.ListSessionsWithMeta()
 		if err != nil {
 			m.viewBuf += errorStyle.Render(fmt.Sprintf("Error listing sessions: %v\n\n", err))
-		} else if len(sessions) == 0 {
+		} else if len(metas) == 0 {
 			m.viewBuf += statusStyle.Render("No saved sessions.\n\n")
 		} else {
-			m.viewBuf += statusStyle.Render("Saved sessions:\n  "+strings.Join(sessions, "\n  ")+"\n\n")
+			m.viewBuf += statusStyle.Render(formatSessionList(metas) + "\n\n")
 		}
 	case "save":
 		name := ""
@@ -586,16 +586,26 @@ func (m Model) handleInit() (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// handleCost shows estimated token usage so far.
+// handleCost shows token usage and best-effort cost estimate for the session.
 func (m Model) handleCost() (tea.Model, tea.Cmd) {
-	compaction := m.loop.Compaction
-	lines := []string{
-		fmt.Sprintf("Input tokens   : %s", formatNum(compaction.TotalInputTokens+m.inputTokens)),
-		fmt.Sprintf("Output tokens  : %s", formatNum(compaction.TotalOutputTokens+m.outputTokens)),
-		fmt.Sprintf("Compactions    : %d", compaction.CompactionCount),
-		"(Cost estimates require model pricing lookup — not yet implemented)",
+	var report string
+	if m.loop.Usage != nil && m.loop.Usage.Turns > 0 {
+		report = m.loop.Usage.FormatSummary()
+		if m.loop.Compaction.CompactionCount > 0 {
+			report += fmt.Sprintf("Compactions    : %d\n", m.loop.Compaction.CompactionCount)
+		}
+	} else {
+		// No turns recorded yet; fall back to compaction-state totals.
+		c := m.loop.Compaction
+		lines := []string{
+			fmt.Sprintf("Input tokens   : %s", formatNum(c.TotalInputTokens)),
+			fmt.Sprintf("Output tokens  : %s", formatNum(c.TotalOutputTokens)),
+			fmt.Sprintf("Compactions    : %d", c.CompactionCount),
+			"Cost           : unavailable (no completed turns yet)",
+		}
+		report = strings.Join(lines, "\n")
 	}
-	m.viewBuf += statusStyle.Render(strings.Join(lines, "\n")+"\n\n")
+	m.viewBuf += statusStyle.Render(report + "\n\n")
 	m = m.refreshViewport()
 	return m, nil
 }
@@ -1404,6 +1414,26 @@ func truncate(s string, n int) string {
 }
 
 // formatNum formats an integer with comma separators.
+// formatSessionList renders a table-style listing of session metadata.
+func formatSessionList(metas []runtime.SessionMeta) string {
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("%-40s  %-19s  %6s  %8s  %8s\n",
+		"ID", "Updated", "Msgs", "In tok", "Out tok"))
+	sb.WriteString(strings.Repeat("-", 90) + "\n")
+	for _, m := range metas {
+		ts := m.UpdatedAt.Format("2006-01-02 15:04:05")
+		id := m.ID
+		if len(id) > 38 {
+			id = id[:35] + "..."
+		}
+		sb.WriteString(fmt.Sprintf("%-40s  %-19s  %6d  %8s  %8s\n",
+			id, ts, m.MessageCount,
+			formatNum(m.TotalInputTokens),
+			formatNum(m.TotalOutputTokens)))
+	}
+	return sb.String()
+}
+
 func formatNum(n int) string {
 	s := fmt.Sprintf("%d", n)
 	if len(s) <= 3 {
