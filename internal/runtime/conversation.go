@@ -44,6 +44,11 @@ func NewConversationLoop(cfg *Config, client api.APIClient) *ConversationLoop {
 	}
 }
 
+// SystemPrompt returns the rendered system prompt for diagnostic use.
+func (loop *ConversationLoop) SystemPrompt() string {
+	return loop.systemPrompt()
+}
+
 // systemPrompt returns the system prompt, optionally injecting a compaction
 // summary and MCP tool context.
 func (loop *ConversationLoop) systemPrompt() string {

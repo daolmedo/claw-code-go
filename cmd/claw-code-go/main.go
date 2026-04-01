@@ -3,6 +3,7 @@ package main
 import (
 	"claw-code-go/internal/auth"
 	"claw-code-go/internal/commands"
+	"claw-code-go/internal/compat"
 	"claw-code-go/internal/permissions"
 	"claw-code-go/internal/runtime"
 	"claw-code-go/internal/tui"
@@ -17,6 +18,24 @@ import (
 )
 
 func main() {
+	// Route diagnostic subcommands before flag parsing.
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "dump-manifests":
+			compat.RunDumpManifests(os.Args[2:])
+			return
+		case "bootstrap-plan":
+			compat.RunBootstrapPlan(os.Args[2:])
+			return
+		case "print-system-prompt":
+			compat.RunPrintSystemPrompt(os.Args[2:])
+			return
+		case "resume-session":
+			compat.RunResumeSession(os.Args[2:])
+			return
+		}
+	}
+
 	promptFlag := flag.String("prompt", "", "Run a single prompt and exit")
 	modelFlag := flag.String("model", "", "Override the model to use")
 	replFlag := flag.Bool("repl", false, "Run in interactive REPL mode (default when no --prompt)")
@@ -26,7 +45,12 @@ func main() {
 	_ = replFlag
 
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "Usage: claw-code-go [options]\n\n")
+		fmt.Fprintf(os.Stderr, "Usage: claw-code-go [subcommand] [options]\n\n")
+		fmt.Fprintf(os.Stderr, "Subcommands:\n")
+		fmt.Fprintf(os.Stderr, "  dump-manifests [--src <dir>] [--json]   List tools, slash commands, and source manifest\n")
+		fmt.Fprintf(os.Stderr, "  bootstrap-plan [--json]                 Print the ordered startup phase plan\n")
+		fmt.Fprintf(os.Stderr, "  print-system-prompt [--cwd] [--date]    Render the full system prompt\n")
+		fmt.Fprintf(os.Stderr, "  resume-session <file> [commands...]     Replay a saved session file\n\n")
 		fmt.Fprintf(os.Stderr, "Options:\n")
 		flag.PrintDefaults()
 		fmt.Fprintf(os.Stderr, "\nEnvironment variables:\n")
