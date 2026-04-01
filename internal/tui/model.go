@@ -8,13 +8,17 @@ import (
 	"strings"
 
 	"github.com/charmbracelet/bubbles/spinner"
+	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/textinput"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 )
 
-const appVersion = "0.1.0"
+const (
+	appVersion   = "0.1.0"
+	textareaRows = 3 // visible rows in the multi-line input area
+)
 
 // modelEntry describes a selectable AI model in the picker overlay.
 type modelEntry struct {
@@ -58,7 +62,7 @@ var anthropicAuthMethods = []loginMethodEntry{
 	{"api_key", "API Key", "Enter your Anthropic API key manually"},
 }
 
-// appState tracks what the TUI is doing.
+// appState tracks what the TUI is currently doing.
 type appState int
 
 const (
@@ -81,6 +85,7 @@ type (
 	streamUsageMsg    struct{ inputTokens, outputTokens int }
 	streamDoneMsg     struct{}
 	streamErrMsg      struct{ err error }
+	streamWarnMsg     struct{ text string }
 	streamPermAskMsg  struct {
 		name, input string
 		reply       chan runtime.PermDecision
@@ -103,8 +108,11 @@ type Model struct {
 	ready  bool
 
 	viewport viewport.Model
-	input    textinput.Model
+	textarea textarea.Model
 	spinner  spinner.Model
+
+	// history for ↑/↓ input navigation
+	history *inputHistory
 
 	// model picker state
 	pickerCursor int
@@ -117,7 +125,7 @@ type Model struct {
 	inputTokens  int
 	outputTokens int
 
-	// whether any streaming content has arrived (for spinner visibility)
+	// whether any streaming content has arrived (suppresses spinner)
 	hasStreamContent bool
 
 	// channel from active streaming goroutine
@@ -131,7 +139,7 @@ type Model struct {
 	// /login flow state
 	loginCursor   int             // cursor for provider / method pickers
 	loginProvider string          // provider selected during login
-	loginKeyInput textinput.Model // API key entry input
+	loginKeyInput textinput.Model // API key entry input (single-line, masked)
 
 	// app deps
 	loop *runtime.ConversationLoop
@@ -140,18 +148,24 @@ type Model struct {
 
 // NewModel creates a new TUI model.
 func NewModel(cfg *runtime.Config, loop *runtime.ConversationLoop) Model {
-	ti := textinput.New()
-	ti.Placeholder = "Type a message or /help..."
-	ti.CharLimit = 8192
+	ta := textarea.New()
+	ta.Placeholder = "Type a message or /help..."
+	ta.CharLimit = 8192
+	ta.ShowLineNumbers = false
+	ta.SetHeight(textareaRows)
+	// Focus the textarea so the cursor is visible from the first render.
+	// The blink Cmd is returned from Init().
+	ta.Focus() //nolint:errcheck
 
 	s := spinner.New()
 	s.Spinner = spinner.Dot
-	s.Style = lipgloss.NewStyle().Foreground(lipgloss.Color("205"))
+	s.Style = lipgloss.NewStyle().Foreground(currentTheme.Primary)
 
 	return Model{
 		state:   stateInput,
-		input:   ti,
+		textarea: ta,
 		spinner: s,
+		history: newInputHistory(),
 		loop:    loop,
 		cfg:     cfg,
 	}
@@ -159,7 +173,8 @@ func NewModel(cfg *runtime.Config, loop *runtime.ConversationLoop) Model {
 
 // Init is the Bubble Tea Init function.
 func (m Model) Init() tea.Cmd {
-	return textinput.Blink
+	// Start cursor blink for the textarea.
+	return m.textarea.Focus()
 }
 
 // --- Update -----------------------------------------------------------------
@@ -190,13 +205,20 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, waitForStream(m.streamChan)
 
 	case streamToolMsg:
-		line := toolStyle.Render(fmt.Sprintf("\n[Tool: %s %s]\n", msg.name, msg.input))
+		if !m.hasStreamContent {
+			m.hasStreamContent = true
+		}
+		line := toolRunningStyle.Render(fmt.Sprintf("  ◆ %s: %s\n", msg.name, truncate(msg.input, 60)))
 		m.streamBuf += line
 		m = m.refreshViewport()
 		return m, waitForStream(m.streamChan)
 
 	case streamToolDoneMsg:
-		line := toolStyle.Render(fmt.Sprintf("[Done: %s]\n", msg.name))
+		suffix := ""
+		if msg.result != "" {
+			suffix = " → " + truncate(msg.result, 40)
+		}
+		line := toolDoneStyle.Render(fmt.Sprintf("  ✓ %s%s\n", msg.name, suffix))
 		m.streamBuf += line
 		m = m.refreshViewport()
 		return m, waitForStream(m.streamChan)
@@ -222,6 +244,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m = m.refreshViewport()
 		m.viewport.GotoBottom()
 		return m, nil
+
+	case streamWarnMsg:
+		m.viewBuf += warnStyle.Render(fmt.Sprintf("Warning: %s\n\n", msg.text))
+		m = m.refreshViewport()
+		return m, waitForStream(m.streamChan)
 
 	case streamPermAskMsg:
 		m.state = statePermission
@@ -282,26 +309,66 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.Type {
 	case tea.KeyCtrlC:
 		return m, tea.Quit
+
 	case tea.KeyEnter:
+		// Submit the message.
 		return m.handleSubmit()
-	case tea.KeyUp, tea.KeyDown, tea.KeyPgUp, tea.KeyPgDown:
+
+	case tea.KeyCtrlJ:
+		// Ctrl+J inserts a real newline into the multi-line input.
+		m.history.Reset()
+		var cmd tea.Cmd
+		m.textarea, cmd = m.textarea.Update(tea.KeyMsg{Type: tea.KeyEnter})
+		return m, cmd
+
+	case tea.KeyUp:
+		// Navigate to previous history entry when input is single-line.
+		if !strings.Contains(m.textarea.Value(), "\n") {
+			prev := m.history.Prev(m.textarea.Value())
+			m.textarea.SetValue(prev)
+			return m, nil
+		}
+		// Multi-line: let textarea handle cursor movement.
+		var cmd tea.Cmd
+		m.textarea, cmd = m.textarea.Update(msg)
+		return m, cmd
+
+	case tea.KeyDown:
+		// Navigate to next history entry when input is single-line.
+		if !strings.Contains(m.textarea.Value(), "\n") {
+			next := m.history.Next()
+			m.textarea.SetValue(next)
+			return m, nil
+		}
+		var cmd tea.Cmd
+		m.textarea, cmd = m.textarea.Update(msg)
+		return m, cmd
+
+	case tea.KeyPgUp, tea.KeyPgDown:
+		// Scroll the conversation viewport.
 		var cmd tea.Cmd
 		m.viewport, cmd = m.viewport.Update(msg)
 		return m, cmd
-	}
 
-	var cmd tea.Cmd
-	m.input, cmd = m.input.Update(msg)
-	return m, cmd
+	default:
+		// All other keys go to the textarea. Reset history navigation on
+		// any edit so the draft is not accidentally discarded.
+		m.history.Reset()
+		var cmd tea.Cmd
+		m.textarea, cmd = m.textarea.Update(msg)
+		return m, cmd
+	}
 }
 
-// handleSubmit processes the current input field value.
+// handleSubmit processes the current textarea value.
 func (m Model) handleSubmit() (tea.Model, tea.Cmd) {
-	text := strings.TrimSpace(m.input.Value())
+	text := strings.TrimSpace(m.textarea.Value())
 	if text == "" {
 		return m, nil
 	}
-	m.input.SetValue("")
+	m.textarea.Reset()
+	m.history.Push(text)
+	m.history.Reset()
 
 	if strings.HasPrefix(text, "/") {
 		return m.handleSlashCommand(text)
@@ -354,6 +421,22 @@ func (m Model) handleSlashCommand(cmd string) (tea.Model, tea.Cmd) {
 			m.viewBuf += statusStyle.Render("No saved sessions.\n\n")
 		} else {
 			m.viewBuf += statusStyle.Render("Saved sessions:\n  " + strings.Join(sessions, "\n  ") + "\n\n")
+		}
+		m = m.refreshViewport()
+		return m, nil
+
+	case "/theme":
+		theme := "dark"
+		if len(parts) > 1 {
+			theme = parts[1]
+		}
+		switch theme {
+		case "light":
+			SetTheme(LightTheme)
+			m.viewBuf += statusStyle.Render("Theme: light.\n\n")
+		default:
+			SetTheme(DarkTheme)
+			m.viewBuf += statusStyle.Render("Theme: dark.\n\n")
 		}
 		m = m.refreshViewport()
 		return m, nil
@@ -444,10 +527,8 @@ func (m Model) handleLoginProviderKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 		switch chosen.id {
 		case "anthropic":
-			// Show auth-method picker for Anthropic (OAuth or API key).
 			m.state = stateLoginMethod
 		default:
-			// For other providers (OpenAI, etc.) go straight to API key entry.
 			m = m.startAPIKeyInput()
 		}
 		return m, nil
@@ -516,7 +597,6 @@ func (m Model) handleLoginAPIKeyKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m = m.refreshViewport()
 			return m, nil
 		}
-		// Save credentials and complete login.
 		saveErr := auth.SetProviderAPIKey(m.loginProvider, apiKey)
 		if saveErr != nil {
 			return m.handleLoginComplete(loginCompleteMsg{err: saveErr})
@@ -533,8 +613,7 @@ func (m Model) handleLoginAPIKeyKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
-// startOAuthLogin prepares the OAuth session (fast), shows the URL in the TUI,
-// then launches a goroutine to complete the browser flow.
+// startOAuthLogin prepares the OAuth session, shows the URL, and waits in background.
 func (m Model) startOAuthLogin() (Model, tea.Cmd) {
 	session, err := auth.PrepareOAuthFlow()
 	if err != nil {
@@ -590,7 +669,6 @@ func (m Model) handleLoginComplete(result loginCompleteMsg) (tea.Model, tea.Cmd)
 		return m, nil
 	}
 
-	// Update config with new provider + credentials.
 	m.cfg.ProviderName = result.provider
 	m.cfg.AuthMethod = result.method
 	if result.method == "oauth" {
@@ -601,7 +679,6 @@ func (m Model) handleLoginComplete(result loginCompleteMsg) (tea.Model, tea.Cmd)
 		m.cfg.OAuthToken = ""
 	}
 
-	// Set a sensible default model for the chosen provider.
 	switch result.provider {
 	case "openai":
 		m.cfg.Model = "gpt-4o"
@@ -610,7 +687,6 @@ func (m Model) handleLoginComplete(result loginCompleteMsg) (tea.Model, tea.Cmd)
 	}
 	m.loop.Config.Model = m.cfg.Model
 
-	// Swap in a new provider client.
 	client, err := runtime.NewProviderClient(m.cfg)
 	if err != nil {
 		m.viewBuf += errorStyle.Render(fmt.Sprintf(
@@ -760,14 +836,16 @@ func (m Model) View() string {
 
 	header := m.renderHeader()
 	divider := dividerStyle.Render(strings.Repeat("─", m.width))
-	inputLine := inputPromptStyle.Render("> ") + m.input.View()
+	hint := statusStyle.Render("Enter=send  Ctrl+J=newline  ↑↓=history  PgUp/PgDn=scroll")
 	statusLine := m.renderStatusBar()
+	inputArea := m.renderInputArea()
 
 	return lipgloss.JoinVertical(lipgloss.Left,
 		header,
 		m.viewport.View(),
 		divider,
-		inputLine,
+		inputArea,
+		hint,
 		statusLine,
 	)
 }
@@ -787,6 +865,22 @@ func (m Model) renderStatusBar() string {
 		))
 	}
 	return statusStyle.Render("Session: " + m.loop.Session.ID)
+}
+
+// renderInputArea renders the multi-line input with a "> " prefix on the first line.
+func (m Model) renderInputArea() string {
+	prompt := inputPromptStyle.Render("> ")
+	tv := m.textarea.View()
+	lines := strings.Split(tv, "\n")
+	result := make([]string, len(lines))
+	for i, line := range lines {
+		if i == 0 {
+			result[i] = prompt + line
+		} else {
+			result[i] = "  " + line
+		}
+	}
+	return strings.Join(result, "\n")
 }
 
 // activeModels returns the model list appropriate for the current provider.
@@ -820,19 +914,25 @@ func (m Model) viewHelp() string {
 	content := lipgloss.JoinVertical(lipgloss.Left,
 		headerStyle.Render("Claw Code — Commands"),
 		"",
-		"  "+userLabelStyle.Render("/login")+"                  Multi-provider login flow",
-		"  "+userLabelStyle.Render("/model")+"                  Change the active model",
-		"  "+userLabelStyle.Render("/help")+"                   Show this help",
-		"  "+userLabelStyle.Render("/clear")+"                  Clear session history",
-		"  "+userLabelStyle.Render("/session-list")+"           List saved sessions",
+		"  "+userLabelStyle.Render("/login")+"                     Multi-provider login flow",
+		"  "+userLabelStyle.Render("/model")+"                     Change the active model",
+		"  "+userLabelStyle.Render("/theme")+" dark|light           Switch TUI color theme",
+		"  "+userLabelStyle.Render("/help")+"                      Show this help",
+		"  "+userLabelStyle.Render("/clear")+"                     Clear session history",
+		"  "+userLabelStyle.Render("/session-list")+"              List saved sessions",
 		"  "+userLabelStyle.Render("/auth")+" login|logout|status  Legacy OAuth commands",
-		"  "+userLabelStyle.Render("/exit")+" / "+userLabelStyle.Render("/quit")+"           Exit (session auto-saved)",
+		"  "+userLabelStyle.Render("/exit")+" / "+userLabelStyle.Render("/quit")+"              Exit (session auto-saved)",
 		"",
-		"  "+userLabelStyle.Render("Ctrl+C")+"                  Exit",
+		statusStyle.Render("Input:"),
+		"  "+userLabelStyle.Render("Enter")+"          Send message",
+		"  "+userLabelStyle.Render("Ctrl+J")+"         Insert newline (multi-line input)",
+		"  "+userLabelStyle.Render("↑ / ↓")+"          Navigate input history (single-line mode)",
+		"  "+userLabelStyle.Render("PgUp / PgDn")+"    Scroll conversation",
+		"  "+userLabelStyle.Render("Ctrl+C")+"         Exit",
 		"",
-		statusStyle.Render("Navigation:  ↑/↓/PgUp/PgDn to scroll  │  Esc/Enter/q to close this panel"),
+		statusStyle.Render("Esc / Enter / q to close this panel"),
 	)
-	box := helpBoxStyle.Width(min(72, m.width-4)).Render(content)
+	box := helpBoxStyle.Width(min(76, m.width-4)).Render(content)
 	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, box)
 }
 
@@ -900,7 +1000,7 @@ func (m Model) viewLoginAPIKey() string {
 		providerName = "provider"
 	}
 	content := lipgloss.JoinVertical(lipgloss.Left,
-		pickerHeaderStyle.Render(fmt.Sprintf("Login — %s API Key", strings.Title(providerName))),
+		pickerHeaderStyle.Render(fmt.Sprintf("Login — %s API Key", strings.Title(providerName))), //nolint:staticcheck
 		"",
 		"  "+statusStyle.Render("Paste your API key below (input is masked):"),
 		"  "+m.loginKeyInput.View(),
@@ -955,28 +1055,29 @@ func waitForStream(ch <-chan runtime.TurnEvent) tea.Cmd {
 	}
 }
 
-// initViewport creates the viewport with appropriate dimensions.
+// initViewport creates the viewport and sets textarea width on first resize.
 func (m Model) initViewport() Model {
 	vpHeight := m.viewportHeight()
 	m.viewport = viewport.New(m.width, vpHeight)
 	m.viewport.SetContent(m.viewBuf)
 	m.viewport.GotoBottom()
-	m.input.Width = max(m.width-3, 10)
+	m.textarea.SetWidth(max(m.width-2, 10))
 	return m
 }
 
-// resizeViewport updates viewport dimensions after a window resize.
+// resizeViewport updates dimensions after a window resize.
 func (m Model) resizeViewport() Model {
 	m.viewport.Width = m.width
 	m.viewport.Height = m.viewportHeight()
-	m.input.Width = max(m.width-3, 10)
+	m.textarea.SetWidth(max(m.width-2, 10))
 	return m
 }
 
-// viewportHeight calculates the viewport height from terminal height.
-// Layout: 1 header + viewport + 1 divider + 1 input + 1 status = 4 overhead lines.
+// viewportHeight calculates the viewport height from the terminal height.
+// Layout overhead: header(1) + divider(1) + textarea(textareaRows) + hint(1) + status(1).
 func (m Model) viewportHeight() int {
-	h := m.height - 4
+	overhead := 4 + textareaRows // header + divider + textarea + hint + status
+	h := m.height - overhead
 	if h < 1 {
 		h = 1
 	}
@@ -992,6 +1093,15 @@ func (m Model) refreshViewport() Model {
 	m.viewport.SetContent(content)
 	m.viewport.GotoBottom()
 	return m
+}
+
+// truncate shortens s to at most n runes, appending "…" if truncated.
+func truncate(s string, n int) string {
+	runes := []rune(s)
+	if len(runes) <= n {
+		return s
+	}
+	return string(runes[:n]) + "…"
 }
 
 // formatNum formats an integer with comma separators.

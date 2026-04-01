@@ -2,53 +2,88 @@ package tui
 
 import "github.com/charmbracelet/lipgloss"
 
+// All TUI styles are derived from currentTheme.
+// Call rebuildStyles (via SetTheme) to refresh after a theme switch.
 var (
+	headerStyle          lipgloss.Style
+	modelTagStyle        lipgloss.Style
+	userLabelStyle       lipgloss.Style
+	assistantLabelStyle  lipgloss.Style
+	toolRunningStyle     lipgloss.Style
+	toolDoneStyle        lipgloss.Style
+	toolFailedStyle      lipgloss.Style
+	statusStyle          lipgloss.Style
+	warnStyle            lipgloss.Style
+	errorStyle           lipgloss.Style
+	helpBoxStyle         lipgloss.Style
+	dividerStyle         lipgloss.Style
+	inputPromptStyle     lipgloss.Style
+	pickerHeaderStyle    lipgloss.Style
+	selectedModelStyle   lipgloss.Style
+	unselectedModelStyle lipgloss.Style
+)
+
+// init seeds styles from the default theme before the first render.
+func init() { rebuildStyles(currentTheme) }
+
+// rebuildStyles recreates all styles from the given theme tokens.
+func rebuildStyles(t Theme) {
 	headerStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("205")).
-			Bold(true)
+		Foreground(t.Primary).
+		Bold(true)
 
 	modelTagStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("244"))
+		Foreground(t.Muted)
 
 	userLabelStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("33")).
-			Bold(true)
+		Foreground(t.UserLabel).
+		Bold(true)
 
 	assistantLabelStyle = lipgloss.NewStyle().
-				Foreground(lipgloss.Color("82")).
-				Bold(true)
+		Foreground(t.AssistantLabel).
+		Bold(true)
 
-	toolStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("214")).
-			Italic(true)
+	toolRunningStyle = lipgloss.NewStyle().
+		Foreground(t.ToolRunning).
+		Italic(true)
+
+	toolDoneStyle = lipgloss.NewStyle().
+		Foreground(t.ToolDone)
+
+	toolFailedStyle = lipgloss.NewStyle().
+		Foreground(t.ToolFailed).
+		Bold(true)
 
 	statusStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("240"))
+		Foreground(t.Muted)
+
+	warnStyle = lipgloss.NewStyle().
+		Foreground(t.Warning)
 
 	errorStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("196"))
+		Foreground(t.Error)
 
 	helpBoxStyle = lipgloss.NewStyle().
-			Border(lipgloss.RoundedBorder()).
-			BorderForeground(lipgloss.Color("62")).
-			Padding(1, 2)
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(t.Secondary).
+		Padding(1, 2)
 
 	dividerStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("238"))
+		Foreground(t.Subtle)
 
 	inputPromptStyle = lipgloss.NewStyle().
-				Foreground(lipgloss.Color("33")).
-				Bold(true)
+		Foreground(t.InputPrompt).
+		Bold(true)
 
 	pickerHeaderStyle = lipgloss.NewStyle().
-				Foreground(lipgloss.Color("205")).
-				Bold(true).
-				Padding(0, 1)
+		Foreground(t.Primary).
+		Bold(true).
+		Padding(0, 1)
 
 	selectedModelStyle = lipgloss.NewStyle().
-				Foreground(lipgloss.Color("170")).
-				Bold(true)
+		Foreground(t.SelectedItem).
+		Bold(true)
 
 	unselectedModelStyle = lipgloss.NewStyle().
-				Foreground(lipgloss.Color("252"))
-)
+		Foreground(t.UnselectedItem)
+}
