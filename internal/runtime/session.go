@@ -16,6 +16,13 @@ type Session struct {
 	Messages  []api.Message `json:"messages"`
 	CreatedAt time.Time     `json:"created_at"`
 	UpdatedAt time.Time     `json:"updated_at"`
+
+	// Compaction state (Phase 6).
+	// CompactionSummary holds the most recent compaction summary text. It is
+	// injected into the system prompt so the model retains earlier context.
+	CompactionSummary string `json:"compaction_summary,omitempty"`
+	// CompactionCount is the number of times this session has been compacted.
+	CompactionCount int `json:"compaction_count,omitempty"`
 }
 
 // NewSession creates a new session with a unique ID based on timestamp.

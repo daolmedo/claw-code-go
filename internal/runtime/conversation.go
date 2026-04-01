@@ -23,6 +23,7 @@ type ConversationLoop struct {
 	PermManager *permissions.Manager // Phase 5 permission manager (may be nil)
 	Config      *Config
 	MCPRegistry *mcp.Registry // MCP server registry (may be nil)
+	Compaction  CompactionState // Phase 6 token tracking and compaction state
 }
 
 // NewConversationLoop creates a new conversation loop with the given client.
@@ -43,20 +44,30 @@ func NewConversationLoop(cfg *Config, client api.APIClient) *ConversationLoop {
 	}
 }
 
-// systemPrompt returns the system prompt, optionally appending MCP tool context.
+// systemPrompt returns the system prompt, optionally injecting a compaction
+// summary and MCP tool context.
 func (loop *ConversationLoop) systemPrompt() string {
-	if loop.MCPRegistry == nil {
-		return systemPromptBase
+	var parts []string
+	parts = append(parts, systemPromptBase)
+
+	// Inject compaction summary when the session has one (Phase 6).
+	if loop.Session != nil && loop.Session.CompactionSummary != "" {
+		parts = append(parts, FormatCompactSummary(loop.Session.CompactionSummary))
 	}
-	mcpTools := loop.MCPRegistry.AllTools()
-	if len(mcpTools) == 0 {
-		return systemPromptBase
+
+	// Append MCP tool list if any servers are connected.
+	if loop.MCPRegistry != nil {
+		mcpTools := loop.MCPRegistry.AllTools()
+		if len(mcpTools) > 0 {
+			names := make([]string, len(mcpTools))
+			for i, t := range mcpTools {
+				names[i] = t.Name
+			}
+			parts = append(parts, "Additional tools available via MCP: "+strings.Join(names, ", ")+".")
+		}
 	}
-	names := make([]string, len(mcpTools))
-	for i, t := range mcpTools {
-		names[i] = t.Name
-	}
-	return systemPromptBase + "\n\nAdditional tools available via MCP: " + strings.Join(names, ", ") + "."
+
+	return strings.Join(parts, "\n\n")
 }
 
 // allTools returns built-in tools merged with any MCP tools.
@@ -83,6 +94,19 @@ func (loop *ConversationLoop) SendMessage(ctx context.Context, userText string) 
 			{Type: "text", Text: userText},
 		},
 	})
+
+	// Compact history if approaching the token budget (Phase 6).
+	if ShouldCompact(loop.Compaction.LastInputTokens, loop.Session.Messages, loop.Config) {
+		summary, err := CompactSession(ctx, loop.Client, loop.Config, loop.Session)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[compact] warning: %v\n", err)
+		} else {
+			loop.Compaction.CompactionCount++
+			// Prepend a continuation marker to the retained recent messages.
+			contMsg := GetContinuationMessage(summary)
+			loop.Session.Messages = append([]api.Message{contMsg}, loop.Session.Messages...)
+		}
+	}
 
 	// Agentic loop: keep going until stop_reason is "end_turn"
 	for {
@@ -264,6 +288,19 @@ func (loop *ConversationLoop) SendMessageStreaming(ctx context.Context, userText
 		},
 	})
 
+	// Compact history if approaching the token budget (Phase 6).
+	if ShouldCompact(loop.Compaction.LastInputTokens, loop.Session.Messages, loop.Config) {
+		summary, err := CompactSession(ctx, loop.Client, loop.Config, loop.Session)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[compact] warning: %v\n", err)
+		} else {
+			loop.Compaction.CompactionCount++
+			// Prepend a continuation marker to the retained recent messages.
+			contMsg := GetContinuationMessage(summary)
+			loop.Session.Messages = append([]api.Message{contMsg}, loop.Session.Messages...)
+		}
+	}
+
 	var totalInput, totalOutput int
 
 	for {
@@ -279,6 +316,11 @@ func (loop *ConversationLoop) SendMessageStreaming(ctx context.Context, userText
 			break
 		}
 	}
+
+	// Update compaction state with the latest token counts (Phase 6).
+	loop.Compaction.LastInputTokens = totalInput
+	loop.Compaction.TotalInputTokens += totalInput
+	loop.Compaction.TotalOutputTokens += totalOutput
 
 	events <- TurnEvent{
 		Type:         TurnEventUsage,

@@ -40,13 +40,26 @@ type Config struct {
 
 	// MCPServers lists MCP server connections (Phase 4).
 	MCPServers []MCPServerConfig
+
+	// Compaction settings (Phase 6).
+	// CompactionEnabled enables automatic session compaction (default: true).
+	CompactionEnabled bool
+	// CompactionThreshold is the fraction of MaxTokens at which compaction
+	// triggers (e.g., 0.75 triggers at 75% of the token budget).
+	CompactionThreshold float64
+	// CompactionKeepRecent is the number of most-recent messages retained
+	// verbatim after compaction.
+	CompactionKeepRecent int
 }
 
 // LoadConfig reads configuration from environment variables and applies defaults.
 func LoadConfig() *Config {
 	cfg := &Config{
-		Model:     DefaultModel,
-		MaxTokens: DefaultMaxTokens,
+		Model:                DefaultModel,
+		MaxTokens:            DefaultMaxTokens,
+		CompactionEnabled:    true,
+		CompactionThreshold:  DefaultCompactionThreshold,
+		CompactionKeepRecent: DefaultCompactionKeepRecent,
 	}
 
 	if key := os.Getenv("ANTHROPIC_API_KEY"); key != "" {
