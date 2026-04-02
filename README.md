@@ -119,11 +119,22 @@ export ANTHROPIC_API_KEY=sk-ant-...
 ./claw-code-go --prompt "Refactor the auth package to use interfaces"
 ```
 
-### OAuth login
+### Login — Anthropic (OAuth)
 
 ```sh
 ./claw-code-go --login
+# or explicitly:
+./claw-code-go --login --provider anthropic
 ```
+
+### Login — OpenAI (API key)
+
+```sh
+./claw-code-go --login --provider openai
+# Prompts for your OpenAI API key and stores it securely
+```
+
+Credentials are saved to `~/.claw-code/credentials/` and reused automatically on the next run. Switch providers at any time with `--provider`.
 
 ### Resume a session
 
@@ -139,8 +150,9 @@ export ANTHROPIC_API_KEY=sk-ant-...
 |------|---------|-------------|
 | `--prompt` | — | Single prompt (one-shot mode) |
 | `--model` | `claude-sonnet-4-20250514` | Model to use |
+| `--provider` | `anthropic` | AI provider: `anthropic`, `openai` |
 | `--repl` | false | Force interactive REPL mode |
-| `--login` | false | Authenticate via OAuth |
+| `--login` | false | Authenticate for the selected provider |
 | `--session` | — | Resume a saved session by ID |
 | `--session-dir` | `~/.claw-code/sessions` | Directory for session files |
 | `--permission-mode` | `ask` | Permission mode: `auto`, `ask`, `deny` |
