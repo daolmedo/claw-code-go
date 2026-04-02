@@ -19,6 +19,12 @@
 
 ---
 
+<p align="center">
+  <img src="assets/screenshot.png" alt="claw-code-go terminal screenshot" width="600" />
+</p>
+
+---
+
 ## What is this?
 
 `claw-code-go` is a full Go reimplementation of [Claude Code](https://docs.anthropic.com/en/docs/claude-code) — Anthropic's agentic coding assistant. It runs in your terminal, understands your codebase, calls tools, writes and edits files, searches the web, and works autonomously until the job is done.
