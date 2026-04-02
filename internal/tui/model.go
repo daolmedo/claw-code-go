@@ -174,12 +174,13 @@ func NewModel(cfg *runtime.Config, loop *runtime.ConversationLoop) Model {
 	s.Style = lipgloss.NewStyle().Foreground(currentTheme.Primary)
 
 	return Model{
-		state:   stateInput,
+		state:    stateInput,
 		textarea: ta,
-		spinner: s,
-		history: newInputHistory(),
-		loop:    loop,
-		cfg:     cfg,
+		spinner:  s,
+		history:  newInputHistory(),
+		loop:     loop,
+		cfg:      cfg,
+		viewBuf:  RenderLogo(appVersion),
 	}
 }
 
