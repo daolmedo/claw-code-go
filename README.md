@@ -1,120 +1,225 @@
 # claw-code-go
 
 <p align="center">
-  <img src="assets/claw-code-go.png" alt="claw-code-go logo" width="320" />
+  <img src="assets/claw-code-go.png" alt="claw-code-go" width="360" />
 </p>
 
-A Go port of Claude Code — the Anthropic CLI coding assistant.
+<p align="center">
+  <strong>A Go port of Claude Code — Anthropic's agentic CLI coding assistant</strong><br/>
+  Fast. Extensible. Built for terminals.
+</p>
 
-## Workspace Layout
+<p align="center">
+  <img src="https://img.shields.io/badge/Go-1.24%2B-00ADD8?style=flat-square&logo=go" />
+  <img src="https://img.shields.io/badge/Claude-claude--sonnet--4-blueviolet?style=flat-square&logo=anthropic" />
+  <img src="https://img.shields.io/badge/MCP-supported-green?style=flat-square" />
+  <img src="https://img.shields.io/badge/Multi--provider-Anthropic%20%7C%20OpenAI-orange?style=flat-square" />
+  <img src="https://img.shields.io/badge/TUI-Bubble%20Tea-pink?style=flat-square" />
+</p>
 
-```
-claw-code-go/
-├── go.mod
-├── cmd/
-│   └── claw-code-go/    # CLI entry point
-│       └── main.go
-└── internal/
-    ├── api/             # Anthropic API client (SSE streaming, types)
-    │   ├── client.go
-    │   └── types.go
-    ├── runtime/         # Conversation loop, session, config, permissions
-    │   ├── config.go
-    │   ├── conversation.go
-    │   ├── permissions.go
-    │   └── session.go
-    ├── tools/           # Tool implementations
-    │   ├── bash.go
-    │   ├── files.go
-    │   ├── glob.go
-    │   └── grep.go
-    ├── commands/        # Slash command registry
-    │   └── registry.go
-    └── compat/          # Upstream TS source reference data
-        └── manifest.go
-```
+---
+
+## What is this?
+
+`claw-code-go` is a full Go reimplementation of [Claude Code](https://docs.anthropic.com/en/docs/claude-code) — Anthropic's agentic coding assistant. It runs in your terminal, understands your codebase, calls tools, writes and edits files, searches the web, and works autonomously until the job is done.
+
+**Why Go?**
+- Single static binary — no Node.js runtime required
+- Faster startup, lower memory footprint
+- Easier to embed, cross-compile, and distribute
+
+---
+
+## Features
+
+### 🤖 Agentic Loop
+Full tool-use conversation loop: Claude reasons, calls tools, reads the results, and keeps going until the task is complete or it hits an `end_turn`.
+
+### 🎨 Bubble Tea TUI
+Rich terminal UI built with [Bubble Tea](https://github.com/charmbracelet/bubbletea) — streaming output with a spinner, styled message history, syntax-aware theming, and a clean session view.
+
+### 🛠 Tool Suite
+
+| Tool | Description |
+|------|-------------|
+| `bash` | Execute shell commands (30s timeout, sandboxed) |
+| `read_file` | Read files from disk |
+| `write_file` | Write/create files |
+| `file_edit` | Surgical text replacements in existing files |
+| `glob` | Find files matching a glob pattern |
+| `grep` | Search across files with regex |
+| `web_fetch` | Fetch and parse a URL |
+| `web_search` | Search the web (Brave API) |
+| `todo_write` | Track and persist task lists |
+
+### 🔐 OAuth + Multi-Provider Auth
+Native OAuth flow for Anthropic accounts. Credentials are stored securely and refreshed automatically. OpenAI is scaffolded alongside Anthropic — swap providers via config.
+
+### 🌐 MCP — Model Context Protocol
+Full MCP integration: connect external tool servers over stdio or SSE, register their tools, and let Claude call them seamlessly alongside built-in tools.
+
+### 🔒 Permissions & Safety
+Fine-grained permission system controls what Claude can do — bash execution, file writes, network access — with configurable modes (`auto`, `ask`, `deny`) and rule-based overrides.
+
+### 📦 Context Assembly
+On every turn, claw-code-go automatically injects:
+- Git repo state (branch, diff summary, recent commits)
+- Memory directory files (`.claw-code/memory/`)
+- System info (OS, hostname, working directory)
+
+### 💾 Session Persistence & History
+Sessions are saved as JSON files in `~/.claw-code/sessions/`. Resume any previous session by ID. The TUI includes a built-in session history browser.
+
+### 📊 Token Usage & Cost Tracking
+Every session tracks input/output tokens per turn. Estimated USD cost is shown at the end of each session for all known models (Claude 3/4 + GPT-4o family).
+
+### ⚡ Context Compaction
+Automatic conversation compaction keeps context windows manageable on long sessions — summarising older turns without losing important state.
+
+### 🧠 Memory Directory
+Drop markdown files into `.claw-code/memory/` and they're injected into every conversation automatically — persistent instructions, project context, preferences.
+
+---
 
 ## Prerequisites
 
-- Go 1.22+
-- `ANTHROPIC_API_KEY` environment variable
+- **Go 1.24+**
+- `ANTHROPIC_API_KEY` environment variable (or log in via `--login`)
 
-## Building
+---
+
+## Install
 
 ```sh
-go build ./...
+git clone https://github.com/daolmedo/claw-code-go
+cd claw-code-go
 go build -o claw-code-go ./cmd/claw-code-go
 ```
 
+Or install directly:
+
+```sh
+go install github.com/daolmedo/claw-code-go/cmd/claw-code-go@latest
+```
+
+---
+
 ## Usage
 
-### One-shot mode
-
-```sh
-export ANTHROPIC_API_KEY=sk-ant-...
-./claw-code-go --prompt "List the files in the current directory"
-```
-
-### Interactive REPL
-
-```sh
-./claw-code-go --repl
-```
-
-Or just run without flags:
+### Interactive REPL (default)
 
 ```sh
 ./claw-code-go
 ```
 
-### Flags
+### One-shot mode
+
+```sh
+export ANTHROPIC_API_KEY=sk-ant-...
+./claw-code-go --prompt "Refactor the auth package to use interfaces"
+```
+
+### OAuth login
+
+```sh
+./claw-code-go --login
+```
+
+### Resume a session
+
+```sh
+./claw-code-go --session <session-id>
+```
+
+---
+
+## CLI Flags
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--prompt` | — | Single prompt (one-shot mode) |
 | `--model` | `claude-sonnet-4-20250514` | Model to use |
 | `--repl` | false | Force interactive REPL mode |
+| `--login` | false | Authenticate via OAuth |
 | `--session` | — | Resume a saved session by ID |
 | `--session-dir` | `~/.claw-code/sessions` | Directory for session files |
+| `--permission-mode` | `ask` | Permission mode: `auto`, `ask`, `deny` |
 
-### Slash Commands (REPL)
+---
+
+## Slash Commands (REPL)
 
 | Command | Description |
 |---------|-------------|
 | `/help` | Show available commands |
-| `/clear` | Clear current session messages |
-| `/session-list` | List saved sessions |
+| `/clear` | Clear the current session |
+| `/session-list` | Browse saved sessions |
+| `/model <name>` | Switch model mid-session |
+| `/compact` | Manually trigger context compaction |
+| `/cost` | Show current session token usage and estimated cost |
 | `/exit` or `/quit` | Exit the REPL |
 
-## Tools Available
-
-| Tool | Description |
-|------|-------------|
-| `bash` | Execute a bash command (30s timeout) |
-| `read_file` | Read a file from disk |
-| `write_file` | Write content to a file |
-| `glob` | Find files matching a glob pattern |
-| `grep` | Search files with a regex pattern |
+---
 
 ## Environment Variables
 
 | Variable | Description |
 |----------|-------------|
-| `ANTHROPIC_API_KEY` | Required. Your Anthropic API key |
+| `ANTHROPIC_API_KEY` | Your Anthropic API key |
 | `ANTHROPIC_MODEL` | Override the default model |
-| `ANTHROPIC_BASE_URL` | Override the API base URL |
+| `ANTHROPIC_BASE_URL` | Override the Anthropic API base URL |
+| `OPENAI_API_KEY` | OpenAI API key (if using OpenAI provider) |
 
-## Session Persistence
+---
 
-Sessions are saved as JSON files in `~/.claw-code/sessions/` (or `--session-dir`). Each session stores the full message history and can be resumed with `--session <id>`.
+## Project Structure
 
-## Architecture
+```
+claw-code-go/
+├── cmd/claw-code-go/        # CLI entry point
+└── internal/
+    ├── api/                 # Anthropic API client (SSE streaming, types)
+    ├── auth/                # OAuth flow, credential storage, token refresh
+    ├── commands/            # Slash command registry
+    ├── compat/              # Upstream TS source parity manifest
+    ├── config/              # Config loading, permission modes, rules
+    ├── context/             # Context assembly (git, memory, sysinfo)
+    ├── mcp/                 # Model Context Protocol client (stdio + SSE)
+    ├── permissions/         # Permission enforcement & rule engine
+    ├── runtime/             # Agentic conversation loop, session persistence
+    ├── tools/               # Built-in tool implementations
+    ├── tui/                 # Bubble Tea TUI (model, styles, theme, history)
+    └── usage/               # Token tracking and cost estimation
+```
 
-The package structure mirrors the Rust port's crate layout:
+---
 
-- **internal/api** — HTTP client with real SSE streaming, parses `data:` frames from the Anthropic messages API
-- **internal/runtime** — Agentic conversation loop with full tool-use support (loops until `end_turn`), session JSON persistence, environment-based config
-- **internal/tools** — Bash execution, file I/O, recursive glob, regex grep
-- **internal/commands** — Slash command registry with duck-typed callback into the conversation loop
-- **internal/compat** — Walks the upstream TypeScript source tree to produce a file manifest
-- **cmd/claw-code-go** — CLI with `--prompt` one-shot and interactive REPL, SIGINT-safe session saving
+## Roadmap
+
+- [x] Phase 1 — Foundation: API client, basic conversation loop, core tools
+- [x] Phase 2 — TUI: Bubble Tea UI, streaming, spinner, slash commands
+- [x] Phase 3 — OAuth + multi-provider scaffolding
+- [x] Phase 4 — MCP (Model Context Protocol) integration
+- [x] Phase 5 — Permissions & Safety
+- [x] Phase 6 — Context compaction
+- [x] Phase 7 — Multi-provider login UX
+- [x] Phase 8 — Compat harness modes
+- [x] Phase 9 — Full TUI foundation (themes, history view)
+- [x] Phase 10 — Core tool expansion (file_edit, web_fetch, web_search, todo_write)
+- [x] Phase 11 — Permissions + config system
+- [x] Phase 12 — Context assembly + memory directory
+- [x] Phase 13 — Cost tracking + session history UI
+- [ ] Phase 14 — LSP integration
+- [ ] Phase 15 — Plugin/extension system
+
+---
+
+## Contributing
+
+PRs welcome. Run `go build ./...` and `go vet ./...` before submitting.
+
+---
+
+## License
+
+MIT
